@@ -151,19 +151,19 @@ impl Session {
         // is rejected before browser extraction, so initialize the Netscape header.
         temp.write_all(b"# Netscape HTTP Cookie File\n")?;
         temp.flush()?;
+        let mut command = tokio::process::Command::new(crate::resolver::tool_path("yt-dlp"));
+        command
+            .args([
+                "--ignore-config",
+                "--cookies-from-browser",
+                &selector,
+                "--cookies",
+            ])
+            .arg(temp.path())
+            .args(["--skip-download", "--quiet", "https://music.youtube.com/"]);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(90),
-            tokio::process::Command::new(crate::resolver::tool_path("yt-dlp"))
-                .args([
-                    "--ignore-config",
-                    "--cookies-from-browser",
-                    &selector,
-                    "--cookies",
-                ])
-                .arg(temp.path())
-                .args(["--skip-download", "--quiet", "https://music.youtube.com/"])
-                .kill_on_drop(true)
-                .output(),
+            crate::helper::output(&mut command),
         )
         .await
         .context("Время импорта истекло")??;

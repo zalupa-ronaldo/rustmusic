@@ -119,10 +119,11 @@ impl Resolver {
         command
             .arg(format!("https://www.youtube.com/watch?v={id}"))
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(70), command.output())
-            .await
-            .context("Время получения потока истекло")?
-            .context("Не найден yt-dlp. Используйте полную сборку RustMusic.")?;
+        let output =
+            tokio::time::timeout(Duration::from_secs(70), crate::helper::output(&mut command))
+                .await
+                .context("Время получения потока истекло")?
+                .context("Не найден yt-dlp. Используйте полную сборку RustMusic.")?;
         if !output.status.success() {
             bail!(
                 "Не удалось получить аудиопоток. Трек может быть недоступен; проверьте сессию или обновите yt-dlp."

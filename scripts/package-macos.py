@@ -77,7 +77,7 @@ def source_notices(manifest):
     for formula,root in sorted(formula_roots.items()):
         print('Collecting sources:',formula,flush=True)
         info=json.loads(run('brew','info','--json=v2',formula))['formulae'][0]
-        stable=info['urls']['stable'];receipt=json.loads((root/'INSTALL_RECEIPT.json').read_text())
+        stable=info['urls']['stable'];receipt=json.loads((root/'INSTALL_RECEIPT.json').read_text().replace(str(pathlib.Path.home()), '$HOME'))
         source_version=receipt.get('source',{}).get('versions',{}).get('stable')
         if source_version and source_version!=info['versions']['stable']:
             recipe=(root/'.brew'/(formula+'.rb')).read_text()
@@ -89,7 +89,7 @@ def source_notices(manifest):
         manifest['homebrew'].append(entry)
         folder=sources/formula;folder.mkdir(exist_ok=True)
         (folder/'formula.json').write_text(json.dumps(info,indent=2)+'\n')
-        shutil.copy2(root/'INSTALL_RECEIPT.json',folder/'INSTALL_RECEIPT.json')
+        (folder/'INSTALL_RECEIPT.json').write_text(json.dumps(receipt,indent=2)+'\n')
         brewfiles=root/'.brew'
         if brewfiles.exists():shutil.copytree(brewfiles,folder/'recipe',dirs_exist_ok=True)
         url=stable['url'];suffix=pathlib.Path(url.split('?')[0]).name or 'source.tar'

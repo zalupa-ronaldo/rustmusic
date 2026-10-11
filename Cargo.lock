@@ -3652,6 +3652,7 @@ name = "rustmusic-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -3659,6 +3660,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
  "ytmusicapi",
 ]
 

@@ -9,6 +9,8 @@ pub struct MusicClient {
     http: reqwest::Client,
     session: Option<Session>,
     context: Arc<OnceCell<Value>>,
+    #[cfg(test)]
+    test_base: Option<String>,
 }
 impl MusicClient {
     pub fn new(session: Option<Session>) -> Result<Self> {
@@ -19,6 +21,8 @@ impl MusicClient {
                 .build()?,
             session,
             context: Arc::new(OnceCell::new()),
+            #[cfg(test)]
+            test_base: None,
         })
     }
     pub fn session(&self) -> Option<&Session> {
@@ -46,11 +50,16 @@ impl MusicClient {
         let mut context = self.context().await?;
         context["client"]["hl"] = json!("ru");
         body["context"] = context;
+        #[cfg(test)]
+        let base = self
+            .test_base
+            .as_deref()
+            .unwrap_or("https://music.youtube.com/youtubei/v1");
+        #[cfg(not(test))]
+        let base = "https://music.youtube.com/youtubei/v1";
         let mut req = self
             .http
-            .post(format!(
-                "https://music.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
-            ))
+            .post(format!("{base}/{endpoint}?prettyPrint=false"))
             .header("origin", "https://music.youtube.com")
             .header("referer", "https://music.youtube.com/")
             .json(&body);
@@ -440,6 +449,87 @@ fn parse_checked(v: &Value) -> Result<Page> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn local_client(status: u16, body: &'static str) -> MusicClient {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut client = MusicClient::new(None).unwrap();
+        client.test_base = Some(format!("http://{address}"));
+        client
+            .context
+            .set(json!({"client":{"clientName":"WEB_REMIX","clientVersion":"fixture"}}))
+            .unwrap();
+        client
+    }
+    #[tokio::test]
+    async fn expired_session_and_service_failures_are_explicit() {
+        for code in [401, 403] {
+            let client = local_client(code, "{}").await;
+            let error = client
+                .request("browse", json!({}))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Сессия истекла"));
+        }
+        let client = local_client(503, "{}").await;
+        assert!(
+            client
+                .request("browse", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("503")
+        );
+        let client = local_client(200, "not json").await;
+        assert!(
+            client
+                .request("browse", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Неизвестный формат")
+        );
+        let client = local_client(200, r#"{"error":{"message":"fixture rejected"}}"#).await;
+        assert!(
+            client
+                .request("browse", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("отклонил")
+        );
+    }
+    #[tokio::test]
+    async fn network_failure_is_actionable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut client = MusicClient::new(None).unwrap();
+        client.test_base = Some(format!("http://{address}"));
+        client
+            .context
+            .set(json!({"client":{"clientName":"WEB_REMIX","clientVersion":"fixture"}}))
+            .unwrap();
+        assert!(
+            client
+                .request("browse", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Ошибка сети")
+        );
+    }
     #[test]
     fn fixture_parses_tracks_and_collections() {
         let v: Value =
