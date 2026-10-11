@@ -12,6 +12,8 @@
 - Expired/forbidden sessions (401/403), service failures, malformed responses
   and connection failures against an isolated local fixture server.
 - Cancellation terminates forked resolver children, not just their parent.
+- A separate owner process exits without running Rust destructors; its mpv
+  child must still terminate (live ignored test).
 - AES-GCM round trip, wrong-key and ciphertext-tamper rejection.
 - Local API authentication, HttpOnly/SameSite cookie and cross-origin rejection.
 - TypeScript checking and production Vite build.
@@ -65,6 +67,7 @@ and verify its library.
 - An unavailable public video ID produced an explicit resolver error.
 - The ad-hoc bundle signature passed deep/strict verification. This build
   requires macOS 26.0 or newer.
+- Player ownership/IPC-disconnect termination passed with bundled mpv.
 - The user-authorized Chrome Default/account 0 session was imported, its
   account was verified, and Keychain persistence survived app relaunch.
 - Authenticated recommendations, liked songs, playlists, albums (empty for

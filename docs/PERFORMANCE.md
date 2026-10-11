@@ -29,3 +29,17 @@ cookies, URLs, titles or browser content. Raw samples and summary are saved to
 `.data/performance`, ignored by Git. Add a sanitized result here only after the
 complete scenario. If reduction is below 50%, profile artwork decoding, retained
 lists, renderer allocations and helper-process peaks before making a claim.
+
+## Attempted validation — 2026-10-11
+
+Two local runs were excluded because native-window interactions changed the
+intended phases. The website also remained paused while the native player
+started, so the playback conditions did not match. No percentage or average
+from these runs is published as an acceptance result. A coordinated 30-minute
+run is still required.
+
+The attempts exposed an mpv process surviving a GUI process exit. The Unix
+player now uses an inherited socketpair with `--input-ipc-client`, whose
+connection lifetime terminates mpv. Windows uses a kill-on-close job object.
+A live test verifies termination after the owner exits without Rust destructors.
+The IPC lifetime behavior is documented in the [mpv manual](https://mpv.io/manual/stable/#options-input-ipc-client).
