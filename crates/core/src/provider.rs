@@ -119,7 +119,9 @@ impl MusicClient {
         if !valid_browse_id(id) {
             bail!("Некорректный идентификатор раздела");
         }
-        if id.starts_with("FEmusic_liked") && !self.authenticated() {
+        if (id.starts_with("FEmusic_liked") || id.starts_with("FEmusic_library"))
+            && !self.authenticated()
+        {
             bail!("Подключите аккаунт для доступа к библиотеке");
         }
         let id = if id.starts_with("PL") || id == "LM" || id.starts_with("RD") {

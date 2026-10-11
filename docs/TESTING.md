@@ -35,8 +35,17 @@ For account validation, connect your session through settings and check:
    Homebrew library references, bundle signature verifies.
 9. Full 30-minute RAM comparison as described in PERFORMANCE.md.
 
-Account-specific checks remain pending until the user connects a Google
-session. Never use mock responses as evidence that those checks passed.
+Account tests require explicit opt-in and a session already connected by the
+user. Never use mock responses as evidence that live checks passed.
+
+```sh
+RUSTMUSIC_LIVE_ACCOUNT=1 cargo run -p rustmusic --example live_account
+```
+
+This creates and deletes a disposable private playlist and briefly removes then
+restores the first liked track. It prints no credentials or personal track data.
+Add `RUSTMUSIC_TEST_DOCKER=1` to import that session into the local Docker server
+and verify its library.
 
 ## Recorded local validation — 2026-10-11
 
@@ -52,5 +61,17 @@ session. Never use mock responses as evidence that those checks passed.
   confirmed with no audio error.
 - The ad-hoc bundle signature passed deep/strict verification. This build
   requires macOS 26.0 or newer.
-- Google-account checks, macOS hardware media keys and the full 30-minute
-  comparative RAM target are not yet recorded as passed.
+- The user-authorized Chrome Default/account 0 session was imported, its
+  account was verified, and Keychain persistence survived app relaunch.
+- Authenticated recommendations, liked songs, playlists, albums (empty for
+  this account), artist library and radio passed against the real service.
+- A private disposable playlist passed create, add, rename, reorder and
+  remove verification via refreshed reads; it was deleted afterwards.
+- Unlike/like passed against the track's own `likeStatus`, with the original
+  like restored. The library list can lag behind the mutation response.
+- Docker accepted the authenticated session, encrypted it in its volume and
+  returned the personal library. Browser mobile layout was inspected at
+  390×844.
+- GitHub CI passed on macOS, Linux and Windows, plus web and Docker jobs.
+- macOS hardware media keys and the full 30-minute comparative RAM target
+  are not yet recorded as passed.

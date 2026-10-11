@@ -31,7 +31,9 @@ impl Route {
             Self::Liked => "Любимые треки",
             Self::Search(_) => "Результаты поиска",
             Self::Browse(id) if id == "FEmusic_liked_albums" => "Альбомы в библиотеке",
-            Self::Browse(id) if id == "FEmusic_liked_artists" => "Исполнители в библиотеке",
+            Self::Browse(id) if id == "FEmusic_library_corpus_track_artists" => {
+                "Исполнители в библиотеке"
+            }
             Self::Browse(_) => "Альбом / плейлист",
             Self::Radio(_) => "Радио",
         }
@@ -781,7 +783,9 @@ impl App {
                 .on_press(Message::Go(Route::Browse("FEmusic_liked_albums".into())))
                 .width(Length::Fill),
             soft_button("Мои исполнители")
-                .on_press(Message::Go(Route::Browse("FEmusic_liked_artists".into())))
+                .on_press(Message::Go(Route::Browse(
+                    "FEmusic_library_corpus_track_artists".into()
+                )))
                 .width(Length::Fill),
             text("ОЧЕРЕДЬ").size(12),
             scrollable(column(self.queue.items.iter().enumerate().map(

@@ -146,7 +146,11 @@ impl Session {
         } else {
             format!("{browser}:{}", profile.trim())
         };
-        let temp = tempfile::NamedTempFile::new()?;
+        let mut temp = tempfile::NamedTempFile::new()?;
+        // yt-dlp loads an existing cookie file before exporting. An empty file
+        // is rejected before browser extraction, so initialize the Netscape header.
+        temp.write_all(b"# Netscape HTTP Cookie File\n")?;
+        temp.flush()?;
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(90),
             tokio::process::Command::new(crate::resolver::tool_path("yt-dlp"))
