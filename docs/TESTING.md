@@ -9,6 +9,9 @@
 - Track/album/artist parsing and pagination on anonymized fixtures; unknown
   provider shapes produce errors instead of fake success.
 - Audio proxy target validation.
+- Expired/forbidden sessions (401/403), service failures, malformed responses
+  and connection failures against an isolated local fixture server.
+- Cancellation terminates forked resolver children, not just their parent.
 - AES-GCM round trip, wrong-key and ciphertext-tamper rejection.
 - Local API authentication, HttpOnly/SameSite cookie and cross-origin rejection.
 - TypeScript checking and production Vite build.
@@ -49,7 +52,7 @@ and verify its library.
 
 ## Recorded local validation — 2026-10-11
 
-- Formatting, Clippy (`--workspace --all-targets -D warnings`), 12 unit tests
+- Formatting, Clippy (`--workspace --all-targets -D warnings`), 15 unit tests
   and the TypeScript/Vite build passed on Apple Silicon.
 - Live public search, home pagination, album/artist browsing and a 50-track
   radio response passed; no mock provider was used.
@@ -59,6 +62,7 @@ and verify its library.
 - Docker Compose built and became healthy. Browser audio played a real track
   (369.63 seconds), and the seek control moved to 120 seconds; pause was
   confirmed with no audio error.
+- An unavailable public video ID produced an explicit resolver error.
 - The ad-hoc bundle signature passed deep/strict verification. This build
   requires macOS 26.0 or newer.
 - The user-authorized Chrome Default/account 0 session was imported, its
@@ -73,5 +77,6 @@ and verify its library.
   returned the personal library. Browser mobile layout was inspected at
   390×844.
 - GitHub CI passed on macOS, Linux and Windows, plus web and Docker jobs.
+  The macOS packaging workflow also passed on a fresh runner.
 - macOS hardware media keys and the full 30-minute comparative RAM target
   are not yet recorded as passed.
