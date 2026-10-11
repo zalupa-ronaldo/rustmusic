@@ -1,0 +1,8 @@
+target
+dist
+.git
+.secrets
+.data
+web/node_modules
+web/dist
+*.log

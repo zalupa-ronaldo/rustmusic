@@ -1,0 +1,25 @@
+[package]
+name = "rustmusic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+rustmusic-core.workspace = true
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "image-without-codecs", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+webbrowser = "1"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+souvlaki = { version = "=0.8.3", default-features = false }
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", features = ["linux-native-sync-persistent", "crypto-rust"] }

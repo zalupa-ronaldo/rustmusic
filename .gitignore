@@ -1,0 +1,17 @@
+/target/
+/dist/
+/.data/
+/.secrets/
+/web/node_modules/
+/web/dist/
+*.dmg
+*.log
+.DS_Store
+cookies*.txt
+headers.json
+browser.json
+session.enc
+
+/output/
+/.playwright-cli/
+**/__pycache__/

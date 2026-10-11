@@ -1,0 +1,27 @@
+services:
+  rustmusic:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - rustmusic-data:/data
+    secrets:
+      - server_key
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+secrets:
+  server_key:
+    file: .secrets/server-key
+volumes:
+  rustmusic-data:

@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/core", "crates/desktop", "crates/server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util", "signal", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rustmusic-core = { path = "crates/core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

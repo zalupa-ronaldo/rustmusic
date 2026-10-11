@@ -1,0 +1,25 @@
+[package]
+name = "rustmusic-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+rustmusic-core.workspace = true
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "limit", "set-header"] }
+aes-gcm = "0.10"
+hex = "0.4"
+rand = "0.9"
+subtle = "2"
+async-stream = "0.3"
+futures-util = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

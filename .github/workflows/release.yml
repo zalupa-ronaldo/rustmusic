@@ -1,0 +1,31 @@
+name: macOS Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install mpv deno
+      - run: python3 scripts/package-macos.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustMusic-macOS-arm64
+          path: dist/*.dmg
+      - if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: |
+            dist/*.dmg
+            dist/*.sha256
+            dist/dependencies.json
+            dist/third-party-sources.tar.gz
