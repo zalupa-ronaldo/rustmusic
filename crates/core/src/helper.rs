@@ -14,7 +14,11 @@ pub(crate) async fn output(command: &mut Command) -> Result<Output> {
     #[cfg(unix)]
     let _tree = Tree(child.id().map(|pid| pid as i32));
     #[cfg(windows)]
-    let _tree = Tree::attach(&child)?;
+    let _tree = WindowsJob::attach_raw(
+        child
+            .raw_handle()
+            .ok_or_else(|| anyhow::anyhow!("Helper already exited"))? as isize,
+    )?;
     Ok(child.wait_with_output().await?)
 }
 #[cfg(unix)]
@@ -31,10 +35,10 @@ impl Drop for Tree {
     }
 }
 #[cfg(windows)]
-struct Tree(isize);
+pub struct WindowsJob(isize);
 #[cfg(windows)]
-impl Tree {
-    fn attach(child: &tokio::process::Child) -> Result<Self> {
+impl WindowsJob {
+    pub fn attach_raw(raw_handle: isize) -> Result<Self> {
         use windows_sys::Win32::System::JobObjects::*;
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         anyhow::ensure!(!handle.is_null(), "Cannot create helper process job");
@@ -50,18 +54,15 @@ impl Tree {
             )
         };
         anyhow::ensure!(configured != 0, "Cannot configure helper process job");
-        let process = child
-            .raw_handle()
-            .ok_or_else(|| anyhow::anyhow!("Helper already exited"))?;
         anyhow::ensure!(
-            unsafe { AssignProcessToJobObject(handle, process) } != 0,
+            unsafe { AssignProcessToJobObject(handle, raw_handle as _) } != 0,
             "Cannot attach helper process job"
         );
         Ok(job)
     }
 }
 #[cfg(windows)]
-impl Drop for Tree {
+impl Drop for WindowsJob {
     fn drop(&mut self) {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0 as _);

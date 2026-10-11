@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use rustmusic_core::{Stream, resolver::tool_path};
 use serde_json::{Value, json};
+#[cfg(windows)]
+use std::time::Instant;
 use std::{
     io::{Read, Write},
     process::{Child, Command, Stdio},
@@ -8,7 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -113,20 +115,24 @@ type Connection = std::fs::File;
 struct Engine {
     child: Child,
     connection: Connection,
-    _directory: tempfile::TempDir,
+    #[cfg(windows)]
+    _job: rustmusic_core::WindowsJob,
     request_id: u64,
 }
 impl Engine {
     fn new() -> Result<Self> {
-        let directory = tempfile::tempdir()?;
         #[cfg(unix)]
-        let socket = directory
-            .path()
-            .join("mpv.sock")
-            .to_string_lossy()
-            .into_owned();
+        let (connection, inherited) = Connection::pair()?;
+        #[cfg(unix)]
+        let stdin = Stdio::from(std::os::fd::OwnedFd::from(inherited));
+        #[cfg(unix)]
+        let ipc = "--input-ipc-client=fd://0".to_owned();
         #[cfg(windows)]
         let socket = format!(r"\\.\pipe\rustmusic-{}", std::process::id());
+        #[cfg(windows)]
+        let stdin = Stdio::null();
+        #[cfg(windows)]
+        let ipc = format!("--input-ipc-server={socket}");
         let child = Command::new(tool_path("mpv"))
             .args([
                 "--no-config",
@@ -142,18 +148,23 @@ impl Engine {
                 "--demuxer-max-bytes=8MiB",
                 "--demuxer-max-back-bytes=2MiB",
             ])
-            .arg(format!("--input-ipc-server={socket}"))
-            .stdin(Stdio::null())
+            .arg(ipc)
+            .stdin(stdin)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .context("Не найден mpv. Используйте полную сборку RustMusic.")?;
+        #[cfg(windows)]
         let mut child = child;
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            rustmusic_core::WindowsJob::attach_raw(child.as_raw_handle() as isize)?
+        };
+        #[cfg(windows)]
         let started = Instant::now();
+        #[cfg(windows)]
         let connection = loop {
-            #[cfg(unix)]
-            let result = Connection::connect(&socket);
-            #[cfg(windows)]
             let result = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -176,7 +187,8 @@ impl Engine {
         Ok(Self {
             child,
             connection,
-            _directory: directory,
+            #[cfg(windows)]
+            _job: job,
             request_id: 0,
         })
     }
@@ -225,6 +237,55 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Internal fixture used by the owner-exit test"]
+    fn lifecycle_owner_fixture() {
+        if std::env::var("RUSTMUSIC_LIFECYCLE_OWNER_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let mut engine = Engine::new().unwrap();
+        engine.property("mpv-version").unwrap();
+        println!("OWNED_PLAYER_PID={}", engine.child.id());
+        std::io::stdout().flush().unwrap();
+        // Deliberately skip Rust destructors, as macOS process termination can do.
+        std::process::exit(0);
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "Requires mpv"]
+    fn mpv_exits_without_owner_destructors() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "player::tests::lifecycle_owner_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUSTMUSIC_LIFECYCLE_OWNER_ONLY", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Lifecycle owner failed");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let pid = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("OWNED_PLAYER_PID=")
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+            .unwrap();
+        for _ in 0..50 {
+            let state = Command::new("ps")
+                .args(["-p", &pid, "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&state.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("mpv survived its owner process");
+    }
     #[tokio::test]
     #[ignore = "requires network access, yt-dlp, Deno, mpv and an audio device"]
     async fn real_stream_play_pause_seek() {

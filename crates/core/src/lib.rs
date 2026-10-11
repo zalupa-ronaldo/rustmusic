@@ -9,3 +9,6 @@ pub use model::*;
 pub use provider::MusicClient;
 pub use queue::{Queue, Repeat};
 pub use resolver::{Resolver, Stream};
+
+#[cfg(windows)]
+pub use helper::WindowsJob;
