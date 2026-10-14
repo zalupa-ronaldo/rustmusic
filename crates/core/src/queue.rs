@@ -24,6 +24,20 @@ impl Queue {
     pub fn current(&self) -> Option<&Item> {
         self.index.and_then(|i| self.items.get(i))
     }
+    /// The track that should be prepared while the current one plays.
+    pub fn upcoming(&self) -> Option<&Item> {
+        let i = self.index?;
+        if self.repeat == Repeat::One || self.items.len() < 2 {
+            return None;
+        }
+        if i + 1 < self.items.len() {
+            return self.items.get(i + 1);
+        }
+        if self.repeat == Repeat::All {
+            return self.items.first();
+        }
+        None
+    }
     pub fn advance(&mut self, ended: bool) -> Option<&Item> {
         let i = self.index?;
         if ended && self.repeat == Repeat::One {
@@ -90,6 +104,19 @@ mod tests {
         q.shuffle();
         assert_eq!(q.current().unwrap().id, "0");
         assert_eq!(q.items.len(), 3);
+    }
+    #[test]
+    fn upcoming_skips_repeat_one_and_wraps() {
+        let mut q = Queue::default();
+        q.replace(items(), 1);
+        assert_eq!(q.upcoming().unwrap().id, "2");
+        q.repeat = Repeat::One;
+        assert!(q.upcoming().is_none());
+        q.repeat = Repeat::All;
+        q.index = Some(2);
+        assert_eq!(q.upcoming().unwrap().id, "0");
+        q.repeat = Repeat::Off;
+        assert!(q.upcoming().is_none());
     }
     #[test]
     fn empty_queue_is_safe() {

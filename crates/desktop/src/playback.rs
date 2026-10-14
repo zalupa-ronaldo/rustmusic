@@ -1,0 +1,212 @@
+use crate::player::Player;
+use anyhow::Result;
+use rustmusic_core::{CacheConfig, Resolver, Stream, TrackCache, valid_video_id};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::task::JoinHandle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKind {
+    Cached,
+    Network,
+    Stale,
+}
+/// Order of work for a track change. `stop` is always first, before any resolve.
+pub fn plan(cached: bool, prefetch: bool) -> &'static [&'static str] {
+    match (cached, prefetch) {
+        (true, true) => &["stop", "load-cache", "prefetch"],
+        (true, false) => &["stop", "load-cache"],
+        (false, true) => &["stop", "resolve", "load-remote", "store", "prefetch"],
+        (false, false) => &["stop", "resolve", "load-remote", "store"],
+    }
+}
+#[derive(Clone)]
+pub struct Playback {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    epoch: AtomicU64,
+    cache: Mutex<TrackCache>,
+    prefetch: Mutex<Option<Prefetch>>,
+}
+struct Prefetch {
+    id: String,
+    handle: AbortJoin<Result<Stream>>,
+}
+struct AbortJoin<T> {
+    handle: Option<JoinHandle<T>>,
+}
+impl<T> AbortJoin<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+    async fn wait(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("prefetch is joined once")
+            .await
+    }
+    async fn cancel(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+impl<T> Drop for AbortJoin<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+impl Playback {
+    pub fn open() -> Self {
+        Self::new(open_cache(CacheConfig::load()))
+    }
+    fn new(cache: TrackCache) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                epoch: AtomicU64::new(0),
+                cache: Mutex::new(cache),
+                prefetch: Mutex::new(None),
+            }),
+        }
+    }
+    pub fn cache(&self) -> TrackCache {
+        lock(&self.inner.cache).clone()
+    }
+    pub fn set_cache(&self, cache: TrackCache) {
+        *lock(&self.inner.cache) = cache;
+    }
+    pub fn arm(&self, epoch: u64) {
+        self.inner.epoch.store(epoch, Ordering::SeqCst);
+    }
+    pub fn cancel_prefetch(&self) {
+        lock(&self.inner.prefetch).take();
+    }
+    pub fn begin_prefetch(&self, epoch: u64, resolver: Resolver, id: String) {
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch || !valid_video_id(&id) {
+            return;
+        }
+        if self.cache().lookup(&id).is_some() {
+            return;
+        }
+        let mut slot = lock(&self.inner.prefetch);
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        if slot.as_ref().is_some_and(|prefetch| prefetch.id == id) {
+            return;
+        }
+        slot.take();
+        let handle = tokio::spawn(async move { resolver.resolve(&id, false).await });
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch {
+            handle.abort();
+            return;
+        }
+        *slot = Some(Prefetch {
+            id,
+            handle: AbortJoin::new(handle),
+        });
+    }
+    async fn claim(&self, id: &str) -> Option<AbortJoin<Result<Stream>>> {
+        match lock(&self.inner.prefetch).take() {
+            Some(prefetch) if prefetch.id == id => Some(prefetch.handle),
+            Some(prefetch) => {
+                prefetch.handle.cancel().await;
+                None
+            }
+            None => None,
+        }
+    }
+}
+pub async fn start(
+    playback: &Playback,
+    player: &Player,
+    resolver: &Resolver,
+    video_id: &str,
+    next_id: Option<String>,
+    epoch: u64,
+) -> Result<StartKind> {
+    // Stop before resolve/cache lookup so the previous track ends at the switch,
+    // not when the next file finally loads. See `plan`.
+    let _ = player.stop().await;
+    if player.epoch() != epoch {
+        return Ok(StartKind::Stale);
+    }
+    let cache = playback.cache();
+    if let Some(path) = cache.lookup(video_id) {
+        player.load_path(path, epoch).await?;
+        prefetch_next(playback, player, resolver, next_id, epoch);
+        return Ok(StartKind::Cached);
+    }
+    let stream = if let Some(prefetched) = playback.claim(video_id).await {
+        match prefetched.wait().await {
+            Ok(Ok(stream)) => stream,
+            _ => resolver.resolve(video_id, false).await?,
+        }
+    } else {
+        resolver.resolve(video_id, false).await?
+    };
+    if player.epoch() != epoch {
+        return Ok(StartKind::Stale);
+    }
+    player.load(stream.clone(), epoch).await?;
+    cache.remember(video_id, stream);
+    prefetch_next(playback, player, resolver, next_id, epoch);
+    Ok(StartKind::Network)
+}
+fn prefetch_next(
+    playback: &Playback,
+    player: &Player,
+    resolver: &Resolver,
+    next_id: Option<String>,
+    epoch: u64,
+) {
+    if player.epoch() == epoch
+        && let Some(next) = next_id
+    {
+        playback.begin_prefetch(epoch, resolver.clone(), next);
+    }
+}
+fn open_cache(config: CacheConfig) -> TrackCache {
+    if let Ok(cache) = TrackCache::open(config.clone()) {
+        return cache;
+    }
+    let fallback = CacheConfig {
+        directory: std::env::temp_dir().join("rustmusic-cache"),
+        limit_bytes: config.limit_bytes,
+    };
+    TrackCache::open(fallback).unwrap_or_else(|_| {
+        TrackCache::open(CacheConfig {
+            directory: std::env::temp_dir().join(format!("rustmusic-{}", std::process::id())),
+            limit_bytes: 0,
+        })
+        .expect("Не удалось создать каталог кэша")
+    })
+}
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stop_precedes_resolve_and_cache_skips_it() {
+        let cold = plan(false, true);
+        let warm = plan(true, true);
+        assert_eq!(cold[0], "stop");
+        assert!(
+            cold.iter().position(|step| *step == "stop").unwrap()
+                < cold.iter().position(|step| *step == "resolve").unwrap()
+        );
+        assert!(!warm.contains(&"resolve"));
+        assert_eq!(warm, ["stop", "load-cache", "prefetch"]);
+        assert!(!plan(true, false).contains(&"resolve"));
+    }
+}
