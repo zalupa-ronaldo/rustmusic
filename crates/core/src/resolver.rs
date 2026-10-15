@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Semaphore};
 
@@ -30,6 +30,7 @@ pub fn tool_path(name: &str) -> PathBuf {
     }
     name.into()
 }
+const MEMORY_CACHE_LIMIT: usize = 16;
 #[derive(Clone)]
 pub struct Stream {
     pub url: String,
@@ -155,20 +156,58 @@ impl Resolver {
             _ => "application/octet-stream",
         }
         .into();
+        let ttl = stream_ttl(&url);
         let stream = Stream {
             url,
             headers,
             mime,
-            expires: Instant::now() + Duration::from_secs(240),
+            expires: Instant::now() + ttl,
         };
-        let mut cache = self.cache.lock().await;
-        cache.retain(|_, s| s.expires > Instant::now());
-        if cache.len() >= 8 {
-            cache.clear();
+        if !ttl.is_zero() {
+            let mut cache = self.cache.lock().await;
+            remember_stream(&mut cache, key, stream.clone());
         }
-        cache.insert(key, stream.clone());
         Ok(stream)
     }
+}
+fn stream_ttl(url: &str) -> Duration {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return Duration::from_secs(240);
+    };
+    let Some(expire) = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "expire")
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+    else {
+        return Duration::from_secs(240);
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let remain = expire.saturating_sub(30).saturating_sub(now);
+    if remain == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(remain.min(15 * 60))
+    }
+}
+fn remember_stream(cache: &mut HashMap<String, Stream>, key: String, stream: Stream) {
+    if stream.expires <= Instant::now() {
+        return;
+    }
+    cache.retain(|_, cached| cached.expires > Instant::now());
+    while cache.len() >= MEMORY_CACHE_LIMIT {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.expires)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(key, stream);
 }
 pub fn validate_stream_url(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).context("Некорректный адрес потока")?;
@@ -197,5 +236,51 @@ mod tests {
             assert!(validate_stream_url(u).is_err());
         }
         assert!(validate_stream_url("https://rr1---sn.googlevideo.com/videoplayback?x=1").is_ok());
+    }
+    #[test]
+    fn stream_ttl_follows_expire_and_stays_bounded() {
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?expire=1"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?expire=9999999999"),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?x=1"),
+            Duration::from_secs(240)
+        );
+    }
+    #[test]
+    fn memory_cache_drops_the_soonest_expiry() {
+        let mut cache = HashMap::new();
+        for index in 0..MEMORY_CACHE_LIMIT {
+            remember_stream(
+                &mut cache,
+                index.to_string(),
+                Stream {
+                    url: "https://rr1---sn.googlevideo.com/x".into(),
+                    headers: HashMap::new(),
+                    mime: "audio/mp4".into(),
+                    expires: Instant::now() + Duration::from_secs(60 + index as u64),
+                },
+            );
+        }
+        assert_eq!(cache.len(), MEMORY_CACHE_LIMIT);
+        remember_stream(
+            &mut cache,
+            "fresh".into(),
+            Stream {
+                url: "https://rr1---sn.googlevideo.com/x".into(),
+                headers: HashMap::new(),
+                mime: "audio/mp4".into(),
+                expires: Instant::now() + Duration::from_secs(10_000),
+            },
+        );
+        assert_eq!(cache.len(), MEMORY_CACHE_LIMIT);
+        assert!(!cache.contains_key("0"));
+        assert!(cache.contains_key("fresh"));
+        assert!(cache.contains_key("1"));
     }
 }

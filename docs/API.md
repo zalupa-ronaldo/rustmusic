@@ -47,5 +47,7 @@ not the server; multiple browser tabs are not independent music sessions.
 
 Audio proxy targets come exclusively from yt-dlp and must be HTTPS subdomains
 of `googlevideo.com`. Redirects are disabled. URLs, cookies and request headers
-are never returned to the frontend. Stream metadata is cached for four minutes,
-maximum eight entries; audio is never persisted.
+are never returned to the frontend. Stream descriptors stay in memory until the
+URL `expire` parameter, capped at 15 minutes, with at most 16 entries. The
+server never persists audio. The desktop app separately caches played audio on
+disk.

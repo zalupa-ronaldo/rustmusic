@@ -9,6 +9,11 @@
 - Track/album/artist parsing and pagination on anonymized fixtures; unknown
   provider shapes produce errors instead of fake success.
 - Audio proxy target validation.
+- Disk-cache LRU eviction, disabled/oversized entries, partial-file cleanup,
+  index rebuild, and cache-hit lookup staying under a network-resolve budget.
+- Stream URL expiry bounds and in-memory descriptor eviction.
+- Playback planning stops the current track before a resolve and skips the
+  resolve when the track is already cached.
 - Expired/forbidden sessions (401/403), service failures, malformed responses
   and connection failures against an isolated local fixture server.
 - Cancellation terminates forked resolver children, not just their parent.
