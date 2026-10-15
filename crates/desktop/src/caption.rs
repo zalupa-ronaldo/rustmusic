@@ -36,7 +36,13 @@ mod tests {
         let only = split_subtitle("  Single label  ");
         assert!(only.artist.is_empty());
         assert_eq!(only.album.as_deref(), Some("Single label"));
-        assert_eq!(split_subtitle("   "), Caption { artist: String::new(), album: None });
+        assert_eq!(
+            split_subtitle("   "),
+            Caption {
+                artist: String::new(),
+                album: None
+            }
+        );
         let nested = split_subtitle("A · B · C");
         assert_eq!(nested.artist, "A · B");
         assert_eq!(nested.album.as_deref(), Some("C"));

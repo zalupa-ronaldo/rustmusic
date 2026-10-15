@@ -1,9 +1,5 @@
 //! Disk cache of tracks that have already been played.
-use crate::{
-    Stream,
-    resolver::validate_stream_url,
-    valid_video_id,
-};
+use crate::{Stream, resolver::validate_stream_url, valid_video_id};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::io::AsyncWriteExt;
 
 const DEFAULT_LIMIT_MB: u64 = 1024;
 const MAX_TRACK_BYTES: u64 = 80 * 1024 * 1024;
@@ -230,12 +227,18 @@ impl TrackCache {
             return None;
         }
         let mut state = lock(&self.inner.state);
-        let position = state.index.entries.iter().position(|entry| entry.id == id)?;
-        let path = self.inner.canonical.join(&state.index.entries[position].name);
-        let fresh = fs::metadata(&path)
-            .ok()
-            .is_some_and(|meta| meta.is_file() && meta.len() == state.index.entries[position].bytes)
-            && contained(&self.inner.canonical, &path);
+        let position = state
+            .index
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)?;
+        let path = self
+            .inner
+            .canonical
+            .join(&state.index.entries[position].name);
+        let fresh = fs::metadata(&path).ok().is_some_and(|meta| {
+            meta.is_file() && meta.len() == state.index.entries[position].bytes
+        }) && contained(&self.inner.canonical, &path);
         if !fresh {
             let entry = state.index.entries.remove(position);
             let _ = fs::remove_file(self.inner.canonical.join(entry.name));
@@ -249,14 +252,17 @@ impl TrackCache {
     }
     /// Download a played stream after playback has already started.
     pub fn remember(&self, id: &str, stream: Stream) {
-        if self.inner.limit_bytes == 0 || !valid_video_id(id) || validate_stream_url(&stream.url).is_err()
+        if self.inner.limit_bytes == 0
+            || !valid_video_id(id)
+            || validate_stream_url(&stream.url).is_err()
         {
             return;
         }
         let ext = extension_for(&stream.mime);
         {
             let mut state = lock(&self.inner.state);
-            if state.index.entries.iter().any(|entry| entry.id == id) || !state.active.insert(id.to_owned())
+            if state.index.entries.iter().any(|entry| entry.id == id)
+                || !state.active.insert(id.to_owned())
             {
                 return;
             }
@@ -298,7 +304,10 @@ impl TrackCache {
         for (key, value) in headers {
             request = request.header(key, value);
         }
-        let response = request.send().await.context("Не удалось скачать трек в кэш")?;
+        let mut response = request
+            .send()
+            .await
+            .context("Не удалось скачать трек в кэш")?;
         if response.status() != reqwest::StatusCode::OK {
             bail!("Кэш не сохранил трек");
         }
@@ -309,7 +318,7 @@ impl TrackCache {
             if total > limit {
                 bail!("Трек больше лимита кэша");
             }
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+            file.write_all(&chunk).await?;
         }
         file.sync_all().await?;
         Ok(total)
@@ -332,10 +341,16 @@ impl TrackCache {
             bytes,
             used,
         });
-        evict(&self.inner.canonical, &mut state.index, self.inner.limit_bytes, id);
+        evict(
+            &self.inner.canonical,
+            &mut state.index,
+            self.inner.limit_bytes,
+            id,
+        );
         save_index(&self.inner.canonical, &state.index)?;
         Ok(())
     }
+    #[cfg(test)]
     fn store_bytes(&self, id: &str, ext: &str, data: &[u8]) -> Result<()> {
         if !valid_video_id(id) {
             bail!("Некорректный идентификатор трека");
@@ -473,7 +488,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::Instant;
-    fn cache(limit: u64) -> (tempfile::TempDir, TrackCache) {
+    fn open_limited(limit: u64) -> (tempfile::TempDir, TrackCache) {
         let dir = tempfile::tempdir().unwrap();
         let cache = TrackCache::open(CacheConfig {
             directory: dir.path().to_path_buf(),
@@ -505,7 +520,7 @@ mod tests {
     }
     #[test]
     fn stores_lookup_and_evicts_least_recently_used() {
-        let (_dir, cache) = cache(100);
+        let (_dir, cache) = open_limited(100);
         cache.store_bytes("aaaaaaaaaaa", "m4a", &[1; 40]).unwrap();
         cache.store_bytes("bbbbbbbbbbb", "m4a", &[2; 40]).unwrap();
         assert!(cache.lookup("aaaaaaaaaaa").is_some());
@@ -517,10 +532,10 @@ mod tests {
     }
     #[test]
     fn disabled_or_oversized_tracks_are_not_kept() {
-        let (_dir, cache) = cache(0);
+        let (_dir, cache) = open_limited(0);
         cache.store_bytes("aaaaaaaaaaa", "m4a", &[1; 20]).unwrap();
         assert!(cache.lookup("aaaaaaaaaaa").is_none());
-        let (_dir, cache) = cache(100);
+        let (_dir, cache) = open_limited(100);
         cache.store_bytes("aaaaaaaaaaa", "m4a", &[1; 500]).unwrap();
         assert!(cache.lookup("aaaaaaaaaaa").is_none());
         assert!(cache.store_bytes("../etc/passwd", "m4a", &[1; 4]).is_err());
@@ -542,7 +557,7 @@ mod tests {
     }
     #[test]
     fn repeated_cache_hits_stay_under_resolve_budget() {
-        let (_dir, cache) = cache(10_000);
+        let (_dir, cache) = open_limited(10_000);
         cache.store_bytes("abcdefghijk", "m4a", b"audio").unwrap();
         let started = Instant::now();
         for _ in 0..50 {
@@ -586,7 +601,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (_dir, cache) = cache(10_000);
+        let (_dir, cache) = open_limited(10_000);
         let partial = cache.partial_path("abcdefghijk", "m4a");
         let bytes = tokio::time::timeout(
             Duration::from_secs(5),
@@ -608,7 +623,7 @@ mod tests {
     }
     #[test]
     fn remember_ignores_non_googlevideo_targets() {
-        let (_dir, cache) = cache(10_000);
+        let (_dir, cache) = open_limited(10_000);
         cache.remember(
             "abcdefghijk",
             Stream {

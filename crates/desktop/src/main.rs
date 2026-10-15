@@ -1,4 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod caption;
+mod playback;
 mod player;
 mod vault;
 use iced::{
@@ -9,7 +11,8 @@ use iced::{
     },
 };
 use rustmusic_core::{
-    Account, Item, ItemKind, MusicClient, Mutation, Page, Queue, Repeat, Resolver, Session,
+    Account, CacheConfig, Item, ItemKind, MusicClient, Mutation, Page, Queue, Repeat, Resolver,
+    Session, TrackCache, default_cache_dir,
 };
 use serde_json::json;
 use std::{collections::HashMap, time::Duration};
@@ -54,7 +57,7 @@ enum Message {
     Enqueue(usize),
     Radio(usize),
     TrackMenu(usize),
-    PlayResult(u64, Result<(), String>),
+    PlayResult(u64, Result<playback::StartKind, String>),
     Toggle,
     Next(bool),
     Previous,
@@ -80,11 +83,18 @@ enum Message {
     Mutate(Mutation),
     MutationDone(Result<String, String>),
     DeleteConfirm(bool),
+    Ready,
+    CacheDir(String),
+    CacheLimit(String),
+    SaveCache,
 }
 struct App {
     client: MusicClient,
     resolver: Resolver,
     player: player::Player,
+    playback: playback::Playback,
+    cache_dir: String,
+    cache_limit: String,
     account: Option<Account>,
     route: Route,
     items: Vec<Item>,
@@ -143,10 +153,16 @@ impl App {
             });
             (media, receiver)
         };
+        let playback = playback::Playback::open();
+        let cache_dir = playback.cache().directory().display().to_string();
+        let cache_limit = (playback.cache().limit_bytes() / (1024 * 1024)).to_string();
         let app = Self {
             client: MusicClient::new(None).expect("HTTP client"),
             resolver: Resolver::new(None),
             player: player::Player::default(),
+            playback,
+            cache_dir,
+            cache_limit,
             account: None,
             route: Route::Home,
             items: vec![],
@@ -181,19 +197,28 @@ impl App {
             #[cfg(target_os = "macos")]
             media_events,
         };
+        let warm_player = app.player.clone();
         (
             app,
-            Task::perform(
-                async {
-                    result(
-                        tokio::task::spawn_blocking(vault::load)
-                            .await
-                            .map_err(anyhow::Error::from)
-                            .and_then(|r| r),
-                    )
-                },
-                Message::Boot,
-            ),
+            Task::batch([
+                Task::perform(
+                    async {
+                        result(
+                            tokio::task::spawn_blocking(vault::load)
+                                .await
+                                .map_err(anyhow::Error::from)
+                                .and_then(|r| r),
+                        )
+                    },
+                    Message::Boot,
+                ),
+                Task::perform(
+                    async move {
+                        let _ = warm_player.warm().await;
+                    },
+                    |_| Message::Ready,
+                ),
+            ]),
         )
     }
     fn fetch(&mut self, route: Route, more: bool) -> Task<Message> {
@@ -243,33 +268,39 @@ impl App {
             handle.abort();
         }
         self.play_id += 1;
-        self.player.set_epoch(self.play_id);
+        let epoch = self.play_id;
+        self.player.set_epoch(epoch);
+        self.playback.arm(epoch);
         let Some(item) = self.queue.current().cloned() else {
             self.playing = false;
             self.loading_audio = false;
+            self.playback.cancel_prefetch();
             self.media_update();
             return self.command(json!(["stop"]));
         };
-        let id = self.play_id;
+        let next = self
+            .queue
+            .upcoming()
+            .map(|track| track.id.clone())
+            .filter(|id| id != &item.id);
         self.loading_audio = true;
         self.playing = false;
         self.position = 0.;
         self.duration = 0.;
-        self.status = format!("Получение потока: {}", item.title);
+        self.status = if self.playback.cache().lookup(&item.id).is_some() {
+            format!("Кэш: {}", item.title)
+        } else {
+            format!("Получение потока: {}", item.title)
+        };
         let resolver = self.resolver.clone();
         let player = self.player.clone();
+        let playback = self.playback.clone();
+        let video_id = item.id;
         let task = Task::perform(
             async move {
-                result(
-                    async {
-                        let stream = resolver.resolve(&item.id, false).await?;
-                        player.load(stream, id).await?;
-                        Ok(())
-                    }
-                    .await,
-                )
+                result(playback::start(&playback, &player, &resolver, &video_id, next, epoch).await)
             },
-            move |r| Message::PlayResult(id, r),
+            move |response| Message::PlayResult(epoch, response),
         );
         let (task, handle) = task.abortable();
         self.play_task = Some(handle);
@@ -530,9 +561,14 @@ impl App {
                 self.loading_audio = false;
                 self.play_task = None;
                 match response {
-                    Ok(()) => {
+                    Ok(playback::StartKind::Stale) => Task::none(),
+                    Ok(kind) => {
                         self.playing = true;
-                        self.status = "Воспроизведение".into();
+                        self.status = if kind == playback::StartKind::Cached {
+                            "Воспроизведение из кэша".into()
+                        } else {
+                            "Воспроизведение".into()
+                        };
                         self.media_update();
                         self.command(json!(["set_property", "volume", self.volume]))
                     }
@@ -633,7 +669,11 @@ impl App {
                         self.duration = status.duration;
                         self.playing = !status.paused;
                         self.media_update();
-                        if status.ended && !self.loading_audio {
+                        if status.ended
+                            && !self.loading_audio
+                            && status.duration > 1.
+                            && status.position + 0.75 >= status.duration
+                        {
                             return self.update(Message::Next(true));
                         }
                     }
@@ -695,6 +735,8 @@ impl App {
                 Ok(()) => {
                     self.play_id += 1;
                     self.player.set_epoch(self.play_id);
+                    self.playback.arm(self.play_id);
+                    self.playback.cancel_prefetch();
                     if let Some(handle) = self.play_task.take() {
                         handle.abort();
                     }
@@ -759,7 +801,46 @@ impl App {
                 self.delete_confirm = v;
                 Task::none()
             }
+            Message::Ready => Task::none(),
+            Message::CacheDir(value) => {
+                self.cache_dir = value;
+                Task::none()
+            }
+            Message::CacheLimit(value) => {
+                self.cache_limit = value;
+                Task::none()
+            }
+            Message::SaveCache => self.save_cache(),
         }
+    }
+    fn save_cache(&mut self) -> Task<Message> {
+        let Ok(limit_mb) = self.cache_limit.trim().parse::<u64>() else {
+            self.status = "Лимит кэша должен быть целым числом мегабайт".into();
+            return Task::none();
+        };
+        let trimmed = self.cache_dir.trim();
+        let directory = if trimmed.is_empty() {
+            default_cache_dir()
+        } else {
+            std::path::PathBuf::from(trimmed)
+        };
+        let config = CacheConfig {
+            directory,
+            limit_bytes: limit_mb.saturating_mul(1024 * 1024),
+        };
+        match TrackCache::open(config.clone()) {
+            Ok(cache) => {
+                self.cache_dir = config.directory.display().to_string();
+                self.cache_limit = limit_mb.to_string();
+                self.playback.set_cache(cache);
+                self.status = match config.save() {
+                    Ok(()) => "Настройки кэша сохранены".into(),
+                    Err(error) => error.to_string(),
+                };
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+        Task::none()
     }
     fn subscription(&self) -> Subscription<Message> {
         iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick)
@@ -790,7 +871,8 @@ impl App {
             text("ОЧЕРЕДЬ").size(12),
             scrollable(column(self.queue.items.iter().enumerate().map(
                 |(i, item)| {
-                    soft_button(
+                    let caption = caption::split_subtitle(&item.subtitle);
+                    let title = soft_button(
                         text(format!(
                             "{} {}",
                             if self.queue.index == Some(i) {
@@ -803,8 +885,19 @@ impl App {
                         .size(12),
                     )
                     .on_press(Message::PlayQueue(i))
-                    .width(Length::Fill)
-                    .into()
+                    .width(Length::Fill);
+                    let mut entry = column![title].spacing(0);
+                    if let Some(album) = caption.album {
+                        entry = entry.push(
+                            soft_button(
+                                text(album).size(11).color(Color::from_rgb8(150, 153, 165)),
+                            )
+                            .style(button::text)
+                            .on_press(Message::PlayQueue(i))
+                            .width(Length::Fill),
+                        );
+                    }
+                    entry.into()
                 }
             )))
             .height(Length::Fill),
@@ -896,19 +989,46 @@ impl App {
                         .center_y(52)
                         .into()
                     });
-                let info = column![
-                    text(&item.title).size(16),
-                    text(&item.subtitle)
-                        .size(12)
-                        .color(Color::from_rgb8(150, 153, 165))
-                ]
-                .spacing(4);
-                let mut line = row![
-                    cover,
-                    soft_button(info)
+                let caption = caption::split_subtitle(&item.subtitle);
+                let muted = Color::from_rgb8(150, 153, 165);
+                let title_button = soft_button(
+                    container(text(&item.title).size(16))
+                        .width(Length::Fill)
+                        .align_x(iced::alignment::Horizontal::Left),
+                )
+                .style(button::text)
+                .on_press(Message::Open(index))
+                .width(Length::FillPortion(3));
+                let mut heading = row![title_button]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center);
+                if let Some(album) = caption.album {
+                    heading = heading.push(
+                        soft_button(text(album).size(12).color(muted))
+                            .style(button::text)
+                            .on_press(Message::Open(index))
+                            .width(Length::FillPortion(2)),
+                    );
+                }
+                let mut info = column![heading].spacing(2).width(Length::Fill);
+                if !caption.artist.is_empty() {
+                    info = info.push(
+                        soft_button(
+                            container(text(caption.artist).size(12).color(muted))
+                                .width(Length::Fill)
+                                .align_x(iced::alignment::Horizontal::Left),
+                        )
                         .style(button::text)
                         .on_press(Message::Open(index))
                         .width(Length::Fill),
+                    );
+                }
+                let mut line = row![
+                    soft_button(cover)
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::Open(index)),
+                    info,
                     text(item.duration.as_deref().unwrap_or("")).size(12)
                 ]
                 .spacing(12)
@@ -1103,6 +1223,21 @@ impl App {
                 manual,
                 text("При отказе Keychain или недоступном профиле используйте ручной импорт.")
                     .size(12),
+                rule::horizontal(1),
+                text("Кэш прослушанных треков").size(22),
+                text(
+                    "Треки, которые уже играли, сохраняются на диск и в следующий раз запускаются без сети. Лимит 0 отключает запись. При переполнении удаляются давно не слушавшиеся файлы.",
+                )
+                .size(12),
+                text_input("Каталог кэша", &self.cache_dir).on_input(Message::CacheDir),
+                text_input("Лимит, МБ", &self.cache_limit).on_input(Message::CacheLimit),
+                soft_button("Сохранить настройки кэша").on_press(Message::SaveCache),
+                text(format!(
+                    "Сейчас занято {} МБ из {} МБ. Переменные RUSTMUSIC_CACHE_DIR и RUSTMUSIC_CACHE_LIMIT_MB перекрывают сохранённые настройки при следующем запуске.",
+                    self.playback.cache().usage_bytes() / (1024 * 1024),
+                    self.playback.cache().limit_bytes() / (1024 * 1024)
+                ))
+                .size(12),
                 soft_button("Выйти и удалить сохранённую сессию").on_press(Message::Disconnect)
             ]
             .spacing(16),

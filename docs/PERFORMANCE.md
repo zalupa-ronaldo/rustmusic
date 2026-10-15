@@ -5,10 +5,11 @@ This is an acceptance target, not a verified claim. Authenticated 30-minute
 comparison has not yet been completed.
 
 The native client uses Iced's tiny-skia software renderer; Chromium/WebKit are
-not included. mpv is started only when a track is selected. Its forward/backward
-buffers are capped at 8/2 MiB. yt-dlp is a short-lived resolver, not a persistent
+not included. mpv is warmed while idle and kept for the next track. Its
+forward/backward buffers are capped at 8/2 MiB, the initial cache pause is off,
+and the audio buffer is 0.1 s. yt-dlp is a short-lived resolver, not a persistent
 browser. The application keeps up to 48 artwork handles, 500 visible items,
-and eight resolved stream descriptors. JPEG/PNG/WebP are the only enabled
+and sixteen resolved stream descriptors. JPEG/PNG/WebP are the only enabled
 artwork codecs. Search and navigation cancel stale provider requests.
 
 Measure the release build launched from Applications. Use a **separate browser

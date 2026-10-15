@@ -59,10 +59,7 @@ impl Player {
         self.start_target(stream.url, headers, epoch).await
     }
     pub async fn load_path(&self, path: std::path::PathBuf, epoch: u64) -> Result<()> {
-        let target = path
-            .to_str()
-            .context("Некорректный путь кэша")?
-            .to_owned();
+        let target = path.to_str().context("Некорректный путь кэша")?.to_owned();
         if target.contains(['\n', '\r']) {
             anyhow::bail!("Некорректный путь кэша");
         }

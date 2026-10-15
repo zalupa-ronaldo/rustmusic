@@ -14,7 +14,8 @@ pub enum StartKind {
     Stale,
 }
 /// Order of work for a track change. `stop` is always first, before any resolve.
-pub fn plan(cached: bool, prefetch: bool) -> &'static [&'static str] {
+#[cfg(test)]
+fn plan(cached: bool, prefetch: bool) -> &'static [&'static str] {
     match (cached, prefetch) {
         (true, true) => &["stop", "load-cache", "prefetch"],
         (true, false) => &["stop", "load-cache"],
@@ -45,10 +46,7 @@ impl<T> AbortJoin<T> {
         }
     }
     async fn wait(mut self) -> std::result::Result<T, tokio::task::JoinError> {
-        self.handle
-            .take()
-            .expect("prefetch is joined once")
-            .await
+        self.handle.take().expect("prefetch is joined once").await
     }
     async fn cancel(mut self) {
         if let Some(handle) = self.handle.take() {
@@ -104,7 +102,8 @@ impl Playback {
             return;
         }
         slot.take();
-        let handle = tokio::spawn(async move { resolver.resolve(&id, false).await });
+        let prefetch_id = id.clone();
+        let handle = tokio::spawn(async move { resolver.resolve(&prefetch_id, false).await });
         if self.inner.epoch.load(Ordering::SeqCst) != epoch {
             handle.abort();
             return;
@@ -115,7 +114,8 @@ impl Playback {
         });
     }
     async fn claim(&self, id: &str) -> Option<AbortJoin<Result<Stream>>> {
-        match lock(&self.inner.prefetch).take() {
+        let taken = lock(&self.inner.prefetch).take();
+        match taken {
             Some(prefetch) if prefetch.id == id => Some(prefetch.handle),
             Some(prefetch) => {
                 prefetch.handle.cancel().await;
