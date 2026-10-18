@@ -30,7 +30,40 @@ impl Player {
     pub fn set_epoch(&self, epoch: u64) {
         self.0.epoch.store(epoch, Ordering::SeqCst);
     }
+    pub fn epoch(&self) -> u64 {
+        self.0.epoch.load(Ordering::SeqCst)
+    }
+    pub async fn warm(&self) -> Result<()> {
+        let player = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut lock = player
+                .0
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Плеер недоступен"))?;
+            ensure_engine(&mut lock)
+        })
+        .await?
+    }
+    pub async fn stop(&self) -> Result<()> {
+        self.command(json!(["stop"])).await
+    }
     pub async fn load(&self, stream: Stream, epoch: u64) -> Result<()> {
+        let headers = stream
+            .headers
+            .into_iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>();
+        self.start_target(stream.url, headers, epoch).await
+    }
+    pub async fn load_path(&self, path: std::path::PathBuf, epoch: u64) -> Result<()> {
+        let target = path.to_str().context("Некорректный путь кэша")?.to_owned();
+        if target.contains(['\n', '\r']) {
+            anyhow::bail!("Некорректный путь кэша");
+        }
+        self.start_target(target, Vec::new(), epoch).await
+    }
+    async fn start_target(&self, target: String, headers: Vec<String>, epoch: u64) -> Result<()> {
         let player = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut lock = player
@@ -41,25 +74,21 @@ impl Player {
             if player.0.epoch.load(Ordering::SeqCst) != epoch {
                 return Ok(());
             }
-            if let Some(engine) = lock.as_mut()
-                && engine.child.try_wait()?.is_some()
-            {
-                *lock = None;
+            ensure_engine(&mut lock)?;
+            if player.0.epoch.load(Ordering::SeqCst) != epoch {
+                return Ok(());
             }
-            if lock.is_none() {
-                *lock = Some(Engine::new()?);
-            }
-            let engine = lock.as_mut().unwrap();
-            let headers = stream
-                .headers
-                .into_iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect::<Vec<_>>();
+            let Some(engine) = lock.as_mut() else {
+                anyhow::bail!("Плеер недоступен");
+            };
             engine
                 .command(json!(["set_property", "http-header-fields", headers]))
                 .context("mpv: настройка заголовков")?;
+            if player.0.epoch.load(Ordering::SeqCst) != epoch {
+                return Ok(());
+            }
             engine
-                .command(json!(["loadfile", stream.url, "replace"]))
+                .command(json!(["loadfile", target, "replace"]))
                 .context("mpv: запуск потока")?;
             engine.note_load();
             engine
@@ -158,6 +187,9 @@ impl Engine {
                 "--input-default-bindings=no",
                 "--input-media-keys=no",
                 "--cache=yes",
+                "--cache-pause-initial=no",
+                "--demuxer-cache-wait=no",
+                "--audio-buffer=0.1",
                 "--demuxer-max-bytes=8MiB",
                 "--demuxer-max-back-bytes=2MiB",
             ])
@@ -254,6 +286,17 @@ impl Engine {
         self.command(json!(["get_property", name]))
     }
 }
+fn ensure_engine(lock: &mut Option<Engine>) -> Result<()> {
+    if let Some(engine) = lock.as_mut()
+        && engine.child.try_wait()?.is_some()
+    {
+        *lock = None;
+    }
+    if lock.is_none() {
+        *lock = Some(Engine::new()?);
+    }
+    Ok(())
+}
 impl Drop for Engine {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -281,18 +324,26 @@ fn playback_failed(
 mod tests {
     use super::*;
     #[test]
-    fn idle_while_opening_is_not_a_failed_download() {
-        assert!(!playback_failed(
-            true,
-            None,
-            Duration::from_millis(500),
-            false
-        ));
+    fn epoch_tracks_the_latest_request() {
+        let player = Player::default();
+        player.set_epoch(4);
+        assert_eq!(player.epoch(), 4);
+    }
+    #[test]
+    fn stop_then_load_is_not_a_failed_download() {
+        // Skip sends stop, then loadfile. The stop reason is not a failed
+        // download, and the idle gap while the next URL opens is not either.
         assert!(!playback_failed(
             true,
             Some("stop"),
             Duration::from_secs(20),
             true
+        ));
+        assert!(!playback_failed(
+            true,
+            None,
+            Duration::from_millis(500),
+            false
         ));
         assert!(!playback_failed(
             false,

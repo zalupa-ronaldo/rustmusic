@@ -147,6 +147,7 @@ fn format_selector(browser: bool) -> &'static str {
         "bestaudio[protocol^=http]/bestaudio"
     }
 }
+const MEMORY_CACHE_LIMIT: usize = 16;
 #[derive(Clone)]
 pub struct Stream {
     pub url: String,
@@ -286,7 +287,6 @@ impl Resolver {
         drop_cached(&mut cache, id);
     }
 }
-const MEMORY_CACHE_LIMIT: usize = 16;
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,6 +422,52 @@ mod tests {
             assert!(validate_stream_url(u).is_err());
         }
         assert!(validate_stream_url("https://rr1---sn.googlevideo.com/videoplayback?x=1").is_ok());
+    }
+    #[test]
+    fn stream_ttl_follows_expire_and_stays_bounded() {
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?expire=1"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?expire=9999999999"),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            stream_ttl("https://rr1---sn.googlevideo.com/videoplayback?x=1"),
+            Duration::from_secs(240)
+        );
+    }
+    #[test]
+    fn memory_cache_drops_the_soonest_expiry() {
+        let mut cache = HashMap::new();
+        for index in 0..MEMORY_CACHE_LIMIT {
+            remember_stream(
+                &mut cache,
+                index.to_string(),
+                Stream {
+                    url: "https://rr1---sn.googlevideo.com/x".into(),
+                    headers: HashMap::new(),
+                    mime: "audio/mp4".into(),
+                    expires: Instant::now() + Duration::from_secs(60 + index as u64),
+                },
+            );
+        }
+        assert_eq!(cache.len(), MEMORY_CACHE_LIMIT);
+        remember_stream(
+            &mut cache,
+            "fresh".into(),
+            Stream {
+                url: "https://rr1---sn.googlevideo.com/x".into(),
+                headers: HashMap::new(),
+                mime: "audio/mp4".into(),
+                expires: Instant::now() + Duration::from_secs(10_000),
+            },
+        );
+        assert_eq!(cache.len(), MEMORY_CACHE_LIMIT);
+        assert!(!cache.contains_key("0"));
+        assert!(cache.contains_key("fresh"));
+        assert!(cache.contains_key("1"));
     }
     #[test]
     fn deno_on_path_is_used_when_working_directory_has_none() {
@@ -578,5 +624,39 @@ mod tests {
         assert!(format_selector(true).contains("ext=m4a"));
         assert!(forward_header("User-Agent"));
         assert!(!forward_header("Cookie"));
+    }
+    #[tokio::test]
+    async fn failed_open_invalidates_the_url_and_drops_the_partial() {
+        let resolver = Resolver::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::TrackCache::open(crate::cache::CacheConfig {
+            directory: dir.path().to_path_buf(),
+            limit_bytes: 10_000,
+        })
+        .unwrap();
+        {
+            let mut guard = resolver.cache.lock().await;
+            for id in ["abcdefghijk", "bbbbbbbbbbb"] {
+                remember_stream(
+                    &mut guard,
+                    format!("{id}:false"),
+                    Stream {
+                        url: "https://rr1---sn.googlevideo.com/videoplayback?x=1".into(),
+                        headers: HashMap::new(),
+                        mime: "audio/mp4".into(),
+                        expires: Instant::now() + Duration::from_secs(60),
+                    },
+                );
+            }
+        }
+        let partial = dir.path().join("abcdefghijk.m4a.partial");
+        std::fs::write(&partial, b"partial").unwrap();
+        crate::cache::clear_failed_open(&resolver, &cache, "abcdefghijk").await;
+        let guard = resolver.cache.lock().await;
+        assert!(!guard.contains_key("abcdefghijk:false"));
+        assert!(!guard.contains_key("abcdefghijk:true"));
+        assert!(guard.contains_key("bbbbbbbbbbb:false"));
+        drop(guard);
+        assert!(!partial.exists());
     }
 }
