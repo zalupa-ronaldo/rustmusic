@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -289,6 +290,41 @@ impl TrackCache {
             cache.settle(&id, ext, generation, outcome);
         });
     }
+    /// Forget an in-flight download, its partial, and a committed file for this id.
+    ///
+    /// A failed open must not keep serving the same bytes on the next attempt.
+    pub fn purge(&self, id: &str) {
+        if !valid_video_id(id) {
+            return;
+        }
+        if protects_pinned(&self.inner.canonical) {
+            let mut state = lock(&self.inner.state);
+            state.inflight.remove(id);
+            state.active.remove(id);
+            return;
+        }
+        let removed = {
+            let mut state = lock(&self.inner.state);
+            state.inflight.remove(id);
+            state.active.remove(id);
+            state
+                .index
+                .entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .map(|position| {
+                    let entry = state.index.entries.remove(position);
+                    let _ = save_index(&self.inner.canonical, &state.index);
+                    entry.name
+                })
+        };
+        if let Some(name) = removed {
+            let _ = fs::remove_file(self.inner.canonical.join(name));
+        }
+        for ext in ALLOWED_EXT {
+            let _ = fs::remove_file(self.partial_path(id, ext));
+        }
+    }
     /// Forget an in-flight download and delete its partial file.
     pub fn discard(&self, id: &str) {
         if !valid_video_id(id) {
@@ -384,7 +420,11 @@ impl TrackCache {
         if protects_pinned(&self.inner.canonical) {
             return Ok(false);
         }
-        if bytes == 0 || bytes > self.max_track() || self.inner.limit_bytes == 0 {
+        if bytes == 0
+            || bytes > self.max_track()
+            || self.inner.limit_bytes == 0
+            || !audio_header_ok(partial)
+        {
             let _ = fs::remove_file(partial);
             return Ok(false);
         }
@@ -440,11 +480,30 @@ impl TrackCache {
         Ok(())
     }
 }
-/// Drop the resolved URL after playback fails to open it, and delete the partial
-/// download so a late response cannot become a cached track.
+/// Drop the resolved URL after playback fails to open it, and delete both the
+/// partial download and any committed file so the next attempt resolves again.
 pub async fn clear_failed_open(resolver: &crate::Resolver, cache: &TrackCache, id: &str) {
     resolver.invalidate(id).await;
-    cache.discard(id);
+    cache.purge(id);
+}
+fn audio_header_ok(path: &Path) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut header = [0u8; 64];
+    let read = file.read(&mut header).unwrap_or(0);
+    has_audio_signature(&header[..read])
+}
+fn has_audio_signature(header: &[u8]) -> bool {
+    if header.len() < 8 {
+        return false;
+    }
+    header.windows(4).take(12).any(|window| window == b"ftyp")
+        || header.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
+        || header.starts_with(b"OggS")
+        || header.starts_with(b"ID3")
+        || (header[0] == 0xFF && (header[1] & 0xE0) == 0xE0)
 }
 fn extension_for(mime: &str) -> &'static str {
     match mime {
@@ -582,6 +641,11 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::Instant;
+    fn fake_audio(len: usize) -> Vec<u8> {
+        let mut data = b"\0\0\0\x18ftypisom".to_vec();
+        data.resize(len.max(12), 1);
+        data
+    }
     fn open_limited(limit: u64) -> (tempfile::TempDir, TrackCache) {
         let dir = tempfile::tempdir().unwrap();
         let cache = TrackCache::open(CacheConfig {
@@ -615,10 +679,16 @@ mod tests {
     #[test]
     fn stores_lookup_and_evicts_least_recently_used() {
         let (_dir, cache) = open_limited(100);
-        cache.store_bytes("aaaaaaaaaaa", "m4a", &[1; 40]).unwrap();
-        cache.store_bytes("bbbbbbbbbbb", "m4a", &[2; 40]).unwrap();
+        cache
+            .store_bytes("aaaaaaaaaaa", "m4a", &fake_audio(40))
+            .unwrap();
+        cache
+            .store_bytes("bbbbbbbbbbb", "m4a", &fake_audio(40))
+            .unwrap();
         assert!(cache.lookup("aaaaaaaaaaa").is_some());
-        cache.store_bytes("ccccccccccc", "m4a", &[3; 40]).unwrap();
+        cache
+            .store_bytes("ccccccccccc", "m4a", &fake_audio(40))
+            .unwrap();
         assert!(cache.lookup("aaaaaaaaaaa").is_some());
         assert!(cache.lookup("bbbbbbbbbbb").is_none());
         assert!(cache.lookup("ccccccccccc").is_some());
@@ -652,7 +722,9 @@ mod tests {
     #[test]
     fn repeated_cache_hits_stay_under_resolve_budget() {
         let (_dir, cache) = open_limited(10_000);
-        cache.store_bytes("abcdefghijk", "m4a", b"audio").unwrap();
+        cache
+            .store_bytes("abcdefghijk", "m4a", &fake_audio(16))
+            .unwrap();
         let started = Instant::now();
         for _ in 0..50 {
             assert!(cache.lookup("abcdefghijk").is_some());
@@ -667,7 +739,8 @@ mod tests {
     async fn downloads_audio_bytes_into_the_cache() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let body = b"cached-audio";
+        let body = fake_audio(16);
+        let served = body.clone();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut collected = Vec::new();
@@ -686,12 +759,12 @@ mod tests {
             }
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                served.len()
             );
             tokio::io::AsyncWriteExt::write_all(&mut socket, header.as_bytes())
                 .await
                 .unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut socket, body)
+            tokio::io::AsyncWriteExt::write_all(&mut socket, &served)
                 .await
                 .unwrap();
         });
@@ -716,6 +789,22 @@ mod tests {
         );
         let path = cache.lookup("abcdefghijk").unwrap();
         assert_eq!(fs::read(path).unwrap(), body);
+    }
+    #[test]
+    fn commit_rejects_non_audio_and_purge_drops_a_committed_file() {
+        let (dir, cache) = open_limited(10_000);
+        cache
+            .store_bytes("abcdefghijk", "m4a", b"<html>no audio here</html>")
+            .unwrap();
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
+        cache
+            .store_bytes("abcdefghijk", "m4a", &fake_audio(24))
+            .unwrap();
+        assert!(cache.lookup("abcdefghijk").is_some());
+        cache.purge("abcdefghijk");
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
     }
     #[test]
     fn remember_ignores_non_googlevideo_targets() {
@@ -783,6 +872,12 @@ mod tests {
         assert!(!dir.path().join("bbbbbbbbbbb.m4a").exists());
         assert_eq!(fs::read(&pinned).unwrap(), vec![9; 80]);
         cache.discard("abcdefghijk");
+        assert_eq!(
+            fs::read(dir.path().join("abcdefghijk.m4a.partial")).unwrap(),
+            b"partial"
+        );
+        cache.purge("abcdefghijk");
+        assert_eq!(fs::read(&pinned).unwrap(), vec![9; 80]);
         assert_eq!(
             fs::read(dir.path().join("abcdefghijk.m4a.partial")).unwrap(),
             b"partial"

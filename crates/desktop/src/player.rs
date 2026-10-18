@@ -81,6 +81,15 @@ impl Player {
             let Some(engine) = lock.as_mut() else {
                 anyhow::bail!("Плеер недоступен");
             };
+            // Drain end-file events that still belong to the previous track.
+            engine
+                .command(json!(["get_property", "idle-active"]))
+                .context("mpv: подготовка")?;
+            // Arm only after that drain, then let loadfile record its own end-file.
+            engine.note_load();
+            if player.0.epoch.load(Ordering::SeqCst) != epoch {
+                return Ok(());
+            }
             engine
                 .command(json!(["set_property", "http-header-fields", headers]))
                 .context("mpv: настройка заголовков")?;
@@ -90,7 +99,6 @@ impl Player {
             engine
                 .command(json!(["loadfile", target, "replace"]))
                 .context("mpv: запуск потока")?;
-            engine.note_load();
             engine
                 .command(json!(["set_property", "pause", false]))
                 .context("mpv: начало воспроизведения")?;
@@ -132,7 +140,7 @@ impl Player {
                 }
                 let since = e.loaded_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
                 let failed = e.loaded_at.is_some()
-                    && playback_failed(idle, e.end_reason.as_deref(), since, e.seen_audio);
+                    && playback_failed(idle, e.failure_reason(), since, e.seen_audio);
                 Ok(Status {
                     position,
                     duration,
@@ -157,7 +165,7 @@ struct Engine {
     #[cfg(windows)]
     _job: rustmusic_core::WindowsJob,
     request_id: u64,
-    end_reason: Option<String>,
+    open: OpenGate,
     loaded_at: Option<Instant>,
     seen_audio: bool,
 }
@@ -235,15 +243,18 @@ impl Engine {
             #[cfg(windows)]
             _job: job,
             request_id: 0,
-            end_reason: None,
+            open: OpenGate::default(),
             loaded_at: None,
             seen_audio: false,
         })
     }
     fn note_load(&mut self) {
-        self.end_reason = None;
+        self.open.arm();
         self.loaded_at = Some(Instant::now());
         self.seen_audio = false;
+    }
+    fn failure_reason(&self) -> Option<&str> {
+        self.open.reason()
     }
     fn command(&mut self, command: Value) -> Result<Value> {
         self.request_id += 1;
@@ -265,11 +276,10 @@ impl Engine {
                 }
             }
             let value: Value = serde_json::from_slice(&line)?;
-            if value.get("event").and_then(|event| event.as_str()) == Some("end-file") {
-                self.end_reason = value
-                    .get("reason")
-                    .and_then(|reason| reason.as_str())
-                    .map(str::to_owned);
+            if value.get("event").and_then(|event| event.as_str()) == Some("end-file")
+                && let Some(reason) = value.get("reason").and_then(|reason| reason.as_str())
+            {
+                self.open.observe(reason);
             }
             if value["request_id"].as_u64() == Some(id) {
                 if value["error"]
@@ -304,6 +314,27 @@ impl Drop for Engine {
     }
 }
 
+/// `end-file` counts only after the current open is armed. Arming clears a
+/// reason that belonged to the previous file.
+#[derive(Debug, Default)]
+struct OpenGate {
+    armed: bool,
+    end_reason: Option<String>,
+}
+impl OpenGate {
+    fn arm(&mut self) {
+        self.armed = true;
+        self.end_reason = None;
+    }
+    fn observe(&mut self, reason: &str) {
+        if self.armed {
+            self.end_reason = Some(reason.to_owned());
+        }
+    }
+    fn reason(&self) -> Option<&str> {
+        self.end_reason.as_deref()
+    }
+}
 fn playback_failed(
     idle: bool,
     end_reason: Option<&str>,
@@ -328,6 +359,19 @@ mod tests {
         let player = Player::default();
         player.set_epoch(4);
         assert_eq!(player.epoch(), 4);
+    }
+    #[test]
+    fn end_file_before_arm_is_ignored_and_arm_clears_a_previous_error() {
+        let mut gate = OpenGate::default();
+        gate.observe("error");
+        assert!(gate.reason().is_none());
+        gate.arm();
+        gate.observe("error");
+        assert_eq!(gate.reason(), Some("error"));
+        gate.arm();
+        assert!(gate.reason().is_none());
+        gate.observe("stop");
+        assert_eq!(gate.reason(), Some("stop"));
     }
     #[test]
     fn stop_then_load_is_not_a_failed_download() {
