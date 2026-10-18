@@ -275,6 +275,21 @@ impl App {
         self.play_task = Some(handle);
         task
     }
+    fn drop_current_stream(&self) -> Task<Message> {
+        let Some(id) = self.queue.current().map(|item| item.id.clone()) else {
+            return Task::none();
+        };
+        self.drop_stream(id)
+    }
+    fn drop_stream(&self, id: String) -> Task<Message> {
+        let resolver = self.resolver.clone();
+        Task::perform(
+            async move {
+                resolver.invalidate(&id).await;
+            },
+            |_| Message::PlayerResult(Ok(())),
+        )
+    }
     fn command(&self, value: serde_json::Value) -> Task<Message> {
         let player = self.player.clone();
         Task::perform(
@@ -558,7 +573,7 @@ impl App {
                     Err(e) => {
                         self.playing = false;
                         self.status = e;
-                        Task::none()
+                        self.drop_current_stream()
                     }
                 }
             }
@@ -642,11 +657,12 @@ impl App {
                 match response {
                     Ok(status) => {
                         if status.failed {
+                            let id = self.queue.current().map(|item| item.id.clone());
                             self.status="Аудиоплеер не смог открыть трек. Повторите выбор или подключите сессию заново.".into();
                             self.playing = false;
                             self.queue.index = None;
                             self.media_update();
-                            return Task::none();
+                            return id.map(|id| self.drop_stream(id)).unwrap_or_else(Task::none);
                         }
                         self.position = status.position;
                         self.duration = status.duration;
