@@ -8,7 +8,7 @@ use rustmusic_core::{ItemKind, MusicClient, Mutation};
 async fn main() -> Result<()> {
     ensure!(
         std::env::var("RUSTMUSIC_LIVE_ACCOUNT").as_deref() == Ok("1"),
-        "Set RUSTMUSIC_LIVE_ACCOUNT=1 to test the session already saved in Keychain"
+        "Set RUSTMUSIC_LIVE_ACCOUNT=1 to test the session already saved by the app"
     );
     let session = if std::env::var("RUSTMUSIC_TEST_CONNECT_CHROME_DEFAULT").as_deref() == Ok("1") {
         let session = rustmusic_core::Session::from_browser("chrome", "Default", "0").await?;
