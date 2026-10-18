@@ -344,7 +344,7 @@ impl App {
             Message::Boot(Ok(Some(session))) => {
                 // Install the restored cookies before the account probe. A
                 // network or account-menu failure must not drop a session that
-                // was already read from disk.
+                // was already read from the keychain.
                 let startup = startup_session(true, false);
                 if startup.active {
                     self.install_session(session.clone());

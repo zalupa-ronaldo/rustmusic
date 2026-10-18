@@ -35,6 +35,12 @@ For account validation, connect your session through settings and check:
 5. Like/unlike a chosen test track and verify on music.youtube.com.
 6. Disconnect, relaunch, confirm credentials are removed; expired cookies
    produce a reconnect prompt. Cancel browser Keychain access and try manual import.
+   On macOS the session is a login-keychain item written by `/usr/bin/security`,
+   not `~/Library/Application Support/rustmusic/session.json`. Quit and relaunch
+   the same build, then rebuild the ad-hoc app (`python3 scripts/package-macos.py`),
+   replace it, and relaunch: the account must still be signed in, with no
+   keychain prompt. A quarantined Finder launch (App Translocation) must keep
+   the session too. Sign-out removes the `beer.rustmusic.app` items.
 7. Docker login, manual session import, browser audio and Range seeking.
 8. Installed `.app` starts without Homebrew/Python in PATH, helpers have no
    Homebrew library references, bundle signature verifies.
