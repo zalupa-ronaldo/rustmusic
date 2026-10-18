@@ -31,6 +31,13 @@ struct Inner {
     epoch: AtomicU64,
     cache: Mutex<TrackCache>,
     prefetch: Mutex<Option<Prefetch>>,
+    /// Download starts only after mpv has actually produced audio.
+    pending_store: Mutex<Option<PendingStore>>,
+}
+struct PendingStore {
+    epoch: u64,
+    id: String,
+    stream: Stream,
 }
 struct Prefetch {
     id: String,
@@ -72,6 +79,7 @@ impl Playback {
                 epoch: AtomicU64::new(0),
                 cache: Mutex::new(cache),
                 prefetch: Mutex::new(None),
+                pending_store: Mutex::new(None),
             }),
         }
     }
@@ -86,6 +94,44 @@ impl Playback {
     }
     pub fn cancel_prefetch(&self) {
         lock(&self.inner.prefetch).take();
+    }
+    /// Remember the stream, but do not download it until playback is audible.
+    pub fn stage_store(&self, epoch: u64, id: &str, stream: Stream) {
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch || !valid_video_id(id) {
+            return;
+        }
+        *lock(&self.inner.pending_store) = Some(PendingStore {
+            epoch,
+            id: id.to_owned(),
+            stream,
+        });
+    }
+    /// Start the disk download once `time-pos` or `duration` has been seen.
+    pub fn commit_store(&self, epoch: u64, id: &str) {
+        let pending = {
+            let mut slot = lock(&self.inner.pending_store);
+            let matches = slot
+                .as_ref()
+                .is_some_and(|pending| pending.epoch == epoch && pending.id == id);
+            if matches { slot.take() } else { None }
+        };
+        if let Some(pending) = pending
+            && self.inner.epoch.load(Ordering::SeqCst) == epoch
+        {
+            self.cache().remember(&pending.id, pending.stream);
+        }
+    }
+    pub fn drop_pending(&self, id: &str) {
+        let mut slot = lock(&self.inner.pending_store);
+        if slot.as_ref().is_some_and(|pending| pending.id == id) {
+            slot.take();
+        }
+    }
+    pub fn clear_pending(&self, epoch: u64) {
+        let mut slot = lock(&self.inner.pending_store);
+        if self.inner.epoch.load(Ordering::SeqCst) == epoch {
+            slot.take();
+        }
     }
     pub fn begin_prefetch(&self, epoch: u64, resolver: Resolver, id: String) {
         if self.inner.epoch.load(Ordering::SeqCst) != epoch || !valid_video_id(&id) {
@@ -136,11 +182,17 @@ pub async fn start(
     // Stop before resolve/cache lookup so the previous track ends at the switch,
     // not when the next file finally loads. See `plan`.
     let _ = player.stop().await;
+    playback.clear_pending(epoch);
     if player.epoch() != epoch {
         return Ok(StartKind::Stale);
     }
     let cache = playback.cache();
-    if let Some(path) = cache.lookup(video_id) {
+    let lookup_id = video_id.to_owned();
+    let cached = tokio::task::spawn_blocking(move || cache.lookup(&lookup_id))
+        .await
+        .ok()
+        .flatten();
+    if let Some(path) = cached {
         player.load_path(path, epoch).await?;
         prefetch_next(playback, player, resolver, next_id, epoch);
         return Ok(StartKind::Cached);
@@ -157,8 +209,9 @@ pub async fn start(
         return Ok(StartKind::Stale);
     }
     player.load(stream.clone(), epoch).await?;
-    // The URL was resolved with the shared yt-dlp and Deno paths.
-    cache.remember(video_id, stream);
+    // Download only after mpv reports audio, so the cache client does not
+    // race the first open of this URL.
+    playback.stage_store(epoch, video_id, stream);
     prefetch_next(playback, player, resolver, next_id, epoch);
     Ok(StartKind::Network)
 }

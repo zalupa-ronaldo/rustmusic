@@ -121,16 +121,13 @@ impl MusicClient {
         } else {
             json!({"query":query})
         };
-        let value = self.request("search", body).await?;
-        parse_checked(&value)
+        parse_off_thread(self.request("search", body).await?).await
     }
     pub async fn browse(&self, id: &str, continuation: Option<&str>) -> Result<Page> {
         if !valid_browse_id(id) {
             bail!("Некорректный идентификатор раздела");
         }
-        if (id.starts_with("FEmusic_liked") || id.starts_with("FEmusic_library"))
-            && !self.authenticated()
-        {
+        if library_requires_session(id) && !self.authenticated() {
             bail!("Подключите аккаунт для доступа к библиотеке");
         }
         let id = if id.starts_with("PL") || id == "LM" || id.starts_with("RD") {
@@ -143,7 +140,7 @@ impl MusicClient {
         } else {
             json!({"browseId":id})
         };
-        parse_checked(&self.request("browse", body).await?)
+        parse_off_thread(self.request("browse", body).await?).await
     }
     pub async fn radio(&self, video_id: &str, continuation: Option<&str>) -> Result<Page> {
         if !valid_video_id(video_id) {
@@ -154,7 +151,11 @@ impl MusicClient {
         } else {
             json!({"videoId":video_id,"playlistId":format!("RDAMVM{video_id}"),"isAudioOnly":true})
         };
-        parse_checked(&self.request("next", body).await?)
+        parse_off_thread(self.request("next", body).await?).await
+    }
+    /// Fetch the Innertube context outside an abortable catalog request.
+    pub async fn warm(&self) -> Result<()> {
+        self.context().await.map(|_| ())
     }
     pub async fn mutate(&self, action: Mutation) -> Result<Value> {
         let session = self.session.as_ref().context("Подключите аккаунт")?;
@@ -258,6 +259,17 @@ impl MusicClient {
 fn provider_error(_: ytmusicapi::Error) -> anyhow::Error {
     anyhow::anyhow!("YouTube Music не подтвердил изменение. Проверьте сессию и права на плейлист.")
 }
+fn library_requires_session(id: &str) -> bool {
+    id.starts_with("FEmusic_liked")
+        || id.starts_with("FEmusic_library")
+        || id == "VLLM"
+        || id == "LM"
+}
+async fn parse_off_thread(value: Value) -> Result<Page> {
+    tokio::task::spawn_blocking(move || parse_checked(&value))
+        .await
+        .context("Не удалось разобрать ответ YouTube Music")?
+}
 fn check_video(id: &str) -> Result<()> {
     if !valid_video_id(id) {
         bail!("Некорректный трек");
@@ -316,10 +328,14 @@ fn thumbnail(v: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 fn parse_renderer(v: &Value) -> Option<Item> {
-    let watch=v.get("navigationEndpoint").and_then(|n|n.get("watchEndpoint"))
+    let watch = v
+        .pointer("/navigationEndpoint/watchEndpoint")
+        .or_else(|| v.pointer("/onTap/watchEndpoint"))
         .or_else(|| v.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint"))
-        .or_else(||v.pointer("/playlistItemData"));
-    let browse = v.pointer("/navigationEndpoint/browseEndpoint");
+        .or_else(|| v.pointer("/playlistItemData"));
+    let browse = v
+        .pointer("/navigationEndpoint/browseEndpoint")
+        .or_else(|| v.pointer("/onTap/browseEndpoint"));
     let flex = v.get("flexColumns").and_then(Value::as_array);
     let title = if let Some(columns) = flex {
         text(&columns.first()?["musicResponsiveListItemFlexColumnRenderer"]["text"])
@@ -390,58 +406,85 @@ fn parse_renderer(v: &Value) -> Option<Item> {
         set_video_id,
     })
 }
-fn collect(v: &Value, items: &mut Vec<Item>) {
+struct Collected {
+    items: Vec<Item>,
+    saw_item_renderer: bool,
+}
+fn is_item_renderer(key: &str) -> bool {
+    key.ends_with("ItemRenderer")
+        || key == "playlistPanelVideoRenderer"
+        || key == "compactStationRenderer"
+}
+fn collect(v: &Value, collected: &mut Collected) {
     match v {
-        Value::Object(o) => {
-            for key in [
-                "musicResponsiveListItemRenderer",
-                "musicTwoRowItemRenderer",
-                "playlistPanelVideoRenderer",
-            ] {
-                if let Some(renderer) = o.get(key) {
-                    if let Some(item) = parse_renderer(renderer) {
-                        items.push(item);
+        Value::Object(object) => {
+            let mut matched = false;
+            for (key, child) in object {
+                if is_item_renderer(key) {
+                    matched = true;
+                    collected.saw_item_renderer = true;
+                    if let Some(item) = parse_renderer(child) {
+                        collected.items.push(item);
                     }
-                    return;
                 }
             }
-            for child in o.values() {
-                collect(child, items);
+            for (key, child) in object {
+                if !matched || !is_item_renderer(key) {
+                    collect(child, collected);
+                }
             }
         }
-        Value::Array(a) => {
-            for child in a {
-                collect(child, items);
+        Value::Array(array) => {
+            for child in array {
+                collect(child, collected);
             }
         }
         _ => {}
     }
 }
-pub fn parse_page(v: &Value) -> Page {
-    let mut items = Vec::new();
-    collect(v, &mut items);
+fn parse_detailed(v: &Value) -> (Page, bool) {
+    let mut collected = Collected {
+        items: Vec::new(),
+        saw_item_renderer: false,
+    };
+    collect(v, &mut collected);
     let mut seen = HashSet::new();
-    items.retain(|i| seen.insert((i.id.clone(), i.set_video_id.clone())));
-    items.truncate(100);
+    collected
+        .items
+        .retain(|item| seen.insert((item.id.clone(), item.set_video_id.clone())));
+    collected.items.truncate(100);
+    let unrecognized = collected.saw_item_renderer && collected.items.is_empty();
     let continuation = find_key(v, "nextContinuationData")
         .or_else(|| find_key(v, "reloadContinuationData"))
-        .and_then(|d| d["continuation"].as_str())
-        .or_else(|| find_key(v, "continuationCommand").and_then(|d| d["token"].as_str()))
+        .and_then(|data| data["continuation"].as_str())
+        .or_else(|| find_key(v, "continuationCommand").and_then(|data| data["token"].as_str()))
         .map(str::to_owned);
-    Page {
-        items,
-        continuation,
-    }
+    (
+        Page {
+            items: collected.items,
+            continuation,
+        },
+        unrecognized,
+    )
+}
+pub fn parse_page(v: &Value) -> Page {
+    parse_detailed(v).0
+}
+fn known_catalog_container(v: &Value) -> bool {
+    find_key(v, "musicShelfRenderer").is_some()
+        || find_key(v, "musicGridRenderer").is_some()
+        || find_key(v, "musicCarouselShelfRenderer").is_some()
+        || find_key(v, "musicImmersiveCarouselShelfRenderer").is_some()
+        || find_key(v, "sectionListRenderer").is_some()
+        || find_key(v, "messageRenderer").is_some()
+        || find_key(v, "continuationContents").is_some()
 }
 fn parse_checked(v: &Value) -> Result<Page> {
-    let page = parse_page(v);
-    if page.items.is_empty()
-        && find_key(v, "musicShelfRenderer").is_none()
-        && find_key(v, "musicGridRenderer").is_none()
-        && find_key(v, "sectionListRenderer").is_none()
-        && find_key(v, "messageRenderer").is_none()
-        && find_key(v, "continuationContents").is_none()
-    {
+    let (page, unrecognized) = parse_detailed(v);
+    if unrecognized {
+        bail!("YouTube Music вернул раздел в неизвестном формате. Попробуйте обновить клиент.");
+    }
+    if page.items.is_empty() && !known_catalog_container(v) {
         bail!("YouTube Music вернул неподдерживаемый ответ. Попробуйте обновить клиент.");
     }
     Ok(page)
@@ -545,5 +588,54 @@ mod tests {
     #[test]
     fn schema_changes_are_not_silent() {
         assert!(parse_checked(&json!({"unknown":{}})).is_err());
+    }
+    #[test]
+    fn empty_shelf_stays_empty_and_unknown_items_are_errors() {
+        let empty = parse_checked(&json!({
+            "contents": {"sectionListRenderer": {"contents": [
+                {"musicShelfRenderer": {"contents": []}}
+            ]}}
+        }))
+        .unwrap();
+        assert!(empty.items.is_empty());
+        let error = parse_checked(&json!({
+            "contents": {"sectionListRenderer": {"contents": [
+                {"musicShelfRenderer": {"contents": [
+                    {"musicWeirdItemRenderer": {"title": {"simpleText": "X"}}}
+                ]}}
+            ]}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("неизвестном формате"));
+    }
+    #[test]
+    fn home_rows_and_stations_parse() {
+        let multi = parse_checked(&json!({
+            "musicMultiRowListItemRenderer": {
+                "title": {"runs": [{"text": "Episode"}]},
+                "subtitle": {"runs": [{"text": "Show"}]},
+                "onTap": {"watchEndpoint": {"videoId": "abcdefghijk"}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(multi.items.len(), 1);
+        assert_eq!(multi.items[0].kind, ItemKind::Track);
+        assert_eq!(multi.items[0].id, "abcdefghijk");
+        let station = parse_checked(&json!({
+            "musicCarouselShelfRenderer": {"contents": [{
+                "compactStationRenderer": {
+                    "title": {"simpleText": "Radio"},
+                    "navigationEndpoint": {"watchEndpoint": {"videoId": "bbcdefghijk"}}
+                }
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(station.items[0].title, "Radio");
+        assert_eq!(station.items[0].kind, ItemKind::Track);
+        assert!(library_requires_session("VLLM"));
+        assert!(library_requires_session("LM"));
+        assert!(library_requires_session("FEmusic_liked_playlists"));
+        assert!(!library_requires_session("FEmusic_home"));
     }
 }

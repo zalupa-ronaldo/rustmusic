@@ -17,7 +17,7 @@ use rustmusic_core::{
 use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     Home,
     Library,
@@ -97,10 +97,17 @@ struct App {
     cache_limit: String,
     account: Option<Account>,
     route: Route,
+    /// Catalog request in flight. A repeated click on this route is ignored.
+    target_route: Option<Route>,
+    /// Set when the user picks a section. The session probe must not replace it.
+    catalog_chosen: bool,
     items: Vec<Item>,
     continuation: Option<String>,
     query: String,
+    /// Catalog and library messages. Playback never writes this field.
     status: String,
+    /// Player messages. Catalog loading never writes this field.
+    player_status: String,
     loading: bool,
     request: u64,
     fetch: Option<iced::task::Handle>,
@@ -114,6 +121,9 @@ struct App {
     volume: f32,
     polling: bool,
     loading_audio: bool,
+    open_failed: bool,
+    played_from_cache: bool,
+    store_armed: bool,
     settings: bool,
     browser: String,
     profile: String,
@@ -165,10 +175,13 @@ impl App {
             cache_limit,
             account: None,
             route: Route::Home,
+            target_route: None,
+            catalog_chosen: false,
             items: vec![],
             continuation: None,
             query: String::new(),
             status: "Подключите Google-аккаунт в настройках".into(),
+            player_status: String::new(),
             loading: false,
             request: 0,
             fetch: None,
@@ -182,6 +195,9 @@ impl App {
             volume: 80.,
             polling: false,
             loading_audio: false,
+            open_failed: false,
+            played_from_cache: false,
+            store_armed: false,
             settings: false,
             browser: "chrome".into(),
             profile: String::new(),
@@ -222,10 +238,16 @@ impl App {
         )
     }
     fn fetch(&mut self, route: Route, more: bool) -> Task<Message> {
+        if keep_inflight_catalog(
+            self.loading,
+            self.target_route.as_ref() == Some(&route),
+            more,
+        ) {
+            return Task::none();
+        }
         if let Some(handle) = self.fetch.take() {
             handle.abort();
         }
-        self.route = route.clone();
         self.request += 1;
         let generation = self.request;
         self.loading = true;
@@ -233,8 +255,7 @@ impl App {
         self.selected = None;
         self.delete_confirm = false;
         if !more {
-            self.items.clear();
-            self.continuation = None;
+            self.target_route = Some(route.clone());
         }
         let continuation = if more {
             self.continuation.clone()
@@ -284,14 +305,13 @@ impl App {
             .map(|track| track.id.clone())
             .filter(|id| id != &item.id);
         self.loading_audio = true;
+        self.open_failed = false;
+        self.played_from_cache = false;
+        self.store_armed = false;
         self.playing = false;
         self.position = 0.;
         self.duration = 0.;
-        self.status = if self.playback.cache().lookup(&item.id).is_some() {
-            format!("Кэш: {}", item.title)
-        } else {
-            format!("Получение потока: {}", item.title)
-        };
+        self.player_status = format!("Открытие: {}", item.title);
         let resolver = self.resolver.clone();
         let player = self.player.clone();
         let playback = self.playback.clone();
@@ -313,6 +333,7 @@ impl App {
         self.drop_stream(id)
     }
     fn drop_stream(&self, id: String) -> Task<Message> {
+        self.playback.drop_pending(&id);
         let resolver = self.resolver.clone();
         let cache = self.playback.cache();
         Task::perform(
@@ -320,6 +341,24 @@ impl App {
                 clear_failed_open(&resolver, &cache, &id).await;
             },
             |_| Message::PlayerResult(Ok(())),
+        )
+    }
+    fn store_audible_track(&mut self, position: f32, duration: f32) -> Task<Message> {
+        let heard = position > 0.05 || duration > 0.;
+        if !heard || self.store_armed {
+            return Task::none();
+        }
+        self.store_armed = true;
+        let Some(id) = self.queue.current().map(|item| item.id.clone()) else {
+            return Task::none();
+        };
+        let playback = self.playback.clone();
+        let epoch = self.play_id;
+        Task::perform(
+            async move {
+                playback.commit_store(epoch, &id);
+            },
+            |_| Message::Ready,
         )
     }
     fn command(&self, value: serde_json::Value) -> Task<Message> {
@@ -356,6 +395,15 @@ impl App {
                 )
             },
             Message::SessionConnected,
+        )
+    }
+    fn warm_catalog(&self) -> Task<Message> {
+        let client = self.client.clone();
+        Task::perform(
+            async move {
+                let _ = client.warm().await;
+            },
+            |_| Message::Ready,
         )
     }
     fn install_session(&mut self, session: Session) {
@@ -397,10 +445,13 @@ impl App {
                     self.install_session(session.clone());
                 }
                 let client = self.client.clone();
-                Task::perform(
-                    async move { result(client.account().await.map(|a| (session, a))) },
-                    Message::SessionConnected,
-                )
+                Task::batch([
+                    Task::perform(
+                        async move { result(client.account().await.map(|a| (session, a))) },
+                        Message::SessionConnected,
+                    ),
+                    self.warm_catalog(),
+                ])
             }
             Message::Boot(Ok(None)) => self.fetch(Route::Home, false),
             Message::Boot(Err(e)) => {
@@ -412,7 +463,7 @@ impl App {
                 match value {
                     Ok((session, account)) => {
                         let startup = startup_session(true, true);
-                        if startup.active {
+                        if startup.active && self.client.session().is_none() {
                             self.install_session(session);
                         }
                         if startup.verified {
@@ -420,15 +471,27 @@ impl App {
                         }
                         self.manual.clear();
                         self.settings = false;
-                        self.fetch(Route::Home, false)
+                        let warm = self.warm_catalog();
+                        if session_may_open_home(self.catalog_chosen) {
+                            Task::batch([warm, self.fetch(Route::Home, false)])
+                        } else {
+                            warm
+                        }
                     }
                     Err(e) => {
-                        self.status = e;
                         if reconnect_prompt(self.client.session().is_some()) {
+                            if !self.loading {
+                                self.status = e;
+                            }
                             self.settings = true;
                             Task::none()
-                        } else {
+                        } else if session_may_open_home(self.catalog_chosen) {
                             self.fetch(Route::Home, false)
+                        } else {
+                            if !self.loading {
+                                self.status = e;
+                            }
+                            Task::none()
                         }
                     }
                 }
@@ -441,14 +504,19 @@ impl App {
                 if self.query.trim().is_empty() {
                     Task::none()
                 } else {
+                    self.catalog_chosen = true;
                     self.fetch(Route::Search(self.query.clone()), false)
                 }
             }
             Message::Go(route) => {
                 self.settings = false;
+                self.catalog_chosen = true;
                 self.fetch(route, false)
             }
-            Message::More => self.fetch(self.route.clone(), true),
+            Message::More => {
+                self.catalog_chosen = true;
+                self.fetch(self.route.clone(), true)
+            }
             Message::Page(id, more, response) => {
                 if id != self.request {
                     return Task::none();
@@ -457,11 +525,15 @@ impl App {
                 self.fetch = None;
                 match response {
                     Err(e) => {
+                        self.target_route = None;
                         self.status = e;
                         Task::none()
                     }
                     Ok(page) => {
                         if !more {
+                            if let Some(route) = self.target_route.take() {
+                                self.route = route;
+                            }
                             self.items.clear();
                         }
                         self.items.extend(page.items);
@@ -500,24 +572,18 @@ impl App {
                                             if bytes.len() > 2 * 1024 * 1024 {
                                                 return None;
                                             }
-                                            let mut reader = ::image::ImageReader::new(
-                                                std::io::Cursor::new(bytes),
-                                            )
-                                            .with_guessed_format()
-                                            .ok()?;
-                                            let mut limits = ::image::Limits::default();
-                                            limits.max_image_width = Some(2048);
-                                            limits.max_image_height = Some(2048);
-                                            limits.max_alloc = Some(16 * 1024 * 1024);
-                                            reader.limits(limits);
-                                            let image = reader
-                                                .decode()
-                                                .ok()?
-                                                .thumbnail(128, 128)
-                                                .to_rgba8();
-                                            Some((image.width(), image.height(), image.into_raw()))
+                                            Some(bytes.to_vec())
                                         }
                                         .await;
+                                        let data = match data {
+                                            Some(bytes) => tokio::task::spawn_blocking(move || {
+                                                decode_cover(&bytes)
+                                            })
+                                            .await
+                                            .ok()
+                                            .flatten(),
+                                            None => None,
+                                        };
                                         (url, data)
                                     },
                                     |(url, data)| Message::Cover(url, data),
@@ -547,6 +613,7 @@ impl App {
                     } else {
                         String::new()
                     };
+                    self.catalog_chosen = true;
                     return self.fetch(Route::Browse(item.id), false);
                 }
                 let tracks = self
@@ -576,6 +643,7 @@ impl App {
             }
             Message::Radio(i) => {
                 if let Some(item) = self.items.get(i) {
+                    self.catalog_chosen = true;
                     self.fetch(Route::Radio(item.id.clone()), false)
                 } else {
                     Task::none()
@@ -599,7 +667,8 @@ impl App {
                     Ok(playback::StartKind::Stale) => Task::none(),
                     Ok(kind) => {
                         self.playing = true;
-                        self.status = if kind == playback::StartKind::Cached {
+                        self.played_from_cache = kind == playback::StartKind::Cached;
+                        self.player_status = if self.played_from_cache {
                             "Воспроизведение из кэша".into()
                         } else {
                             "Воспроизведение".into()
@@ -609,7 +678,8 @@ impl App {
                     }
                     Err(e) => {
                         self.playing = false;
-                        self.status = e;
+                        self.open_failed = true;
+                        self.player_status = e;
                         self.drop_current_stream()
                     }
                 }
@@ -617,6 +687,9 @@ impl App {
             Message::Toggle => {
                 if self.queue.current().is_none() {
                     return Task::none();
+                }
+                if self.open_failed {
+                    return self.play();
                 }
                 self.playing = !self.playing;
                 self.media_update();
@@ -675,7 +748,11 @@ impl App {
                         }
                     }
                 }
-                if !self.polling && !self.loading_audio && self.queue.current().is_some() {
+                if !self.polling
+                    && !self.loading_audio
+                    && !self.open_failed
+                    && self.queue.current().is_some()
+                {
                     self.polling = true;
                     let player = self.player.clone();
                     let epoch = self.play_id;
@@ -694,27 +771,32 @@ impl App {
                 match response {
                     Ok(status) => {
                         if status.failed {
-                            let id = self.queue.current().map(|item| item.id.clone());
-                            self.status="Аудиоплеер не смог открыть трек. Повторите выбор или подключите сессию заново.".into();
+                            if self.open_failed {
+                                return Task::none();
+                            }
+                            self.open_failed = true;
                             self.playing = false;
-                            self.queue.index = None;
+                            self.player_status = player_open_error(self.played_from_cache).into();
                             self.media_update();
+                            let id = self.queue.current().map(|item| item.id.clone());
                             return id.map(|id| self.drop_stream(id)).unwrap_or_else(Task::none);
                         }
                         self.position = status.position;
                         self.duration = status.duration;
                         self.playing = !status.paused;
                         self.media_update();
+                        let store = self.store_audible_track(status.position, status.duration);
                         if status.ended
                             && !self.loading_audio
                             && status.duration > 1.
                             && status.position + 0.75 >= status.duration
                         {
-                            return self.update(Message::Next(true));
+                            return Task::batch([store, self.update(Message::Next(true))]);
                         }
+                        return store;
                     }
                     Err(e) => {
-                        self.status = e;
+                        self.player_status = e;
                         self.playing = false;
                     }
                 }
@@ -722,7 +804,7 @@ impl App {
             }
             Message::PlayerResult(response) => {
                 if let Err(e) = response {
-                    self.status = e;
+                    self.player_status = e;
                 }
                 Task::none()
             }
@@ -781,6 +863,8 @@ impl App {
                     self.resolver = Resolver::new(None);
                     self.queue = Queue::default();
                     self.playing = false;
+                    self.open_failed = false;
+                    self.player_status.clear();
                     self.items.clear();
                     self.covers.clear();
                     self.status = "Сохранённая сессия удалена".into();
@@ -822,8 +906,10 @@ impl App {
                         self.status = "Изменение сохранено".into();
                         if !id.is_empty() {
                             self.target = id.clone();
+                            self.catalog_chosen = true;
                             self.fetch(Route::Browse(id), false)
                         } else {
+                            self.catalog_chosen = true;
                             self.fetch(self.route.clone(), false)
                         }
                     }
@@ -1166,29 +1252,38 @@ impl App {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
-        let footer = column![
-            row![
-                column![
-                    text(
-                        current
-                            .map(|i| i.title.as_str())
-                            .unwrap_or("Выберите музыку")
-                    )
-                    .size(16),
-                    text(
-                        current
-                            .map(|i| i.subtitle.as_str())
-                            .unwrap_or("Нативный звук • Rust")
-                    )
-                    .size(12)
-                ]
-                .width(Length::Fill),
-                controls,
-                text("Громкость").size(12),
-                slider(0.0..=100.0, self.volume, Message::Volume).width(100)
+        let transport = row![
+            column![
+                text(
+                    current
+                        .map(|i| i.title.as_str())
+                        .unwrap_or("Выберите музыку")
+                )
+                .size(16),
+                text(
+                    current
+                        .map(|i| i.subtitle.as_str())
+                        .unwrap_or("Нативный звук • Rust")
+                )
+                .size(12)
             ]
-            .spacing(16)
-            .align_y(iced::Alignment::Center),
+            .width(Length::Fill),
+            controls,
+            text("Громкость").size(12),
+            slider(0.0..=100.0, self.volume, Message::Volume).width(100)
+        ]
+        .spacing(16)
+        .align_y(iced::Alignment::Center);
+        let mut footer = column![transport].spacing(12).padding(18);
+        if !self.player_status.is_empty() {
+            let color = if self.open_failed {
+                accent
+            } else {
+                Color::from_rgb8(172, 175, 187)
+            };
+            footer = footer.push(text(&self.player_status).size(12).color(color));
+        }
+        let footer = footer.push(
             row![
                 text(time(self.position)).size(12),
                 slider(
@@ -1198,10 +1293,8 @@ impl App {
                 ),
                 text(time(self.duration)).size(12)
             ]
-            .spacing(12)
-        ]
-        .spacing(12)
-        .padding(18);
+            .spacing(12),
+        );
         column![
             row![sidebar, main].height(Length::Fill),
             rule::horizontal(1),
@@ -1301,6 +1394,40 @@ fn reconnect_prompt(session_active: bool) -> bool {
     !session_active
 }
 
+/// A second click on the tab that is already loading must not cancel that load.
+fn keep_inflight_catalog(loading: bool, same_route: bool, more: bool) -> bool {
+    loading && same_route && !more
+}
+
+/// Home is opened after sign-in only when the user has not chosen a section.
+fn session_may_open_home(catalog_chosen: bool) -> bool {
+    !catalog_chosen
+}
+
+fn player_open_error(from_cache: bool) -> &'static str {
+    if from_cache {
+        "Не удалось открыть файл в кэше. Повторите трек — он будет запрошен заново."
+    } else {
+        "Не удалось открыть адрес потока. Повторите выбор трека."
+    }
+}
+
+fn decode_cover(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if bytes.len() > 2 * 1024 * 1024 {
+        return None;
+    }
+    let mut reader = ::image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = ::image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?.thumbnail(128, 128).to_rgba8();
+    Some((image.width(), image.height(), image.into_raw()))
+}
+
 fn soft_button<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Button<'a, Message> {
     iced::widget::button(content).style(button::secondary)
 }
@@ -1329,7 +1456,10 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{reconnect_prompt, startup_session};
+    use super::{
+        keep_inflight_catalog, player_open_error, reconnect_prompt, session_may_open_home,
+        startup_session,
+    };
 
     #[test]
     fn restored_session_stays_active_when_account_probe_fails() {
@@ -1340,5 +1470,27 @@ mod tests {
         let verified = startup_session(true, true);
         assert!(verified.active && verified.verified);
         assert!(reconnect_prompt(startup_session(false, true).active));
+    }
+
+    #[test]
+    fn repeated_catalog_click_keeps_the_inflight_request() {
+        assert!(keep_inflight_catalog(true, true, false));
+        assert!(!keep_inflight_catalog(true, false, false));
+        assert!(!keep_inflight_catalog(false, true, false));
+        assert!(!keep_inflight_catalog(true, true, true));
+    }
+
+    #[test]
+    fn session_probe_does_not_replace_a_chosen_tab() {
+        assert!(session_may_open_home(false));
+        assert!(!session_may_open_home(true));
+    }
+
+    #[test]
+    fn player_open_errors_do_not_ask_to_reconnect() {
+        assert!(!player_open_error(true).contains("сесс"));
+        assert!(!player_open_error(false).contains("сесс"));
+        assert!(player_open_error(true).contains("кэш"));
+        assert!(player_open_error(false).contains("адрес потока"));
     }
 }
