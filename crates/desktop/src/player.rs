@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use rustmusic_core::{Stream, resolver::tool_path};
 use serde_json::{Value, json};
-#[cfg(windows)]
-use std::time::Instant;
 use std::{
     io::{Read, Write},
     process::{Child, Command, Stdio},
@@ -10,7 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +61,7 @@ impl Player {
             engine
                 .command(json!(["loadfile", stream.url, "replace"]))
                 .context("mpv: запуск потока")?;
+            engine.note_load();
             engine
                 .command(json!(["set_property", "pause", false]))
                 .context("mpv: начало воспроизведения")?;
@@ -94,12 +93,23 @@ impl Player {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Плеер недоступен"))?;
             if let Some(e) = lock.as_mut() {
+                let position = e.property("time-pos")?.as_f64().unwrap_or(0.) as f32;
+                let duration = e.property("duration")?.as_f64().unwrap_or(0.) as f32;
+                let paused = e.property("pause")?.as_bool().unwrap_or(false);
+                let ended = e.property("eof-reached")?.as_bool().unwrap_or(false);
+                let idle = e.property("idle-active")?.as_bool().unwrap_or(false);
+                if position > 0.05 || duration > 0. {
+                    e.seen_audio = true;
+                }
+                let since = e.loaded_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+                let failed = e.loaded_at.is_some()
+                    && playback_failed(idle, e.end_reason.as_deref(), since, e.seen_audio);
                 Ok(Status {
-                    position: e.property("time-pos")?.as_f64().unwrap_or(0.) as f32,
-                    duration: e.property("duration")?.as_f64().unwrap_or(0.) as f32,
-                    paused: e.property("pause")?.as_bool().unwrap_or(false),
-                    ended: e.property("eof-reached")?.as_bool().unwrap_or(false),
-                    failed: e.property("idle-active")?.as_bool().unwrap_or(false),
+                    position,
+                    duration,
+                    paused,
+                    ended,
+                    failed,
                 })
             } else {
                 Ok(Status::default())
@@ -118,6 +128,9 @@ struct Engine {
     #[cfg(windows)]
     _job: rustmusic_core::WindowsJob,
     request_id: u64,
+    end_reason: Option<String>,
+    loaded_at: Option<Instant>,
+    seen_audio: bool,
 }
 impl Engine {
     fn new() -> Result<Self> {
@@ -190,7 +203,15 @@ impl Engine {
             #[cfg(windows)]
             _job: job,
             request_id: 0,
+            end_reason: None,
+            loaded_at: None,
+            seen_audio: false,
         })
+    }
+    fn note_load(&mut self) {
+        self.end_reason = None;
+        self.loaded_at = Some(Instant::now());
+        self.seen_audio = false;
     }
     fn command(&mut self, command: Value) -> Result<Value> {
         self.request_id += 1;
@@ -212,6 +233,12 @@ impl Engine {
                 }
             }
             let value: Value = serde_json::from_slice(&line)?;
+            if value.get("event").and_then(|event| event.as_str()) == Some("end-file") {
+                self.end_reason = value
+                    .get("reason")
+                    .and_then(|reason| reason.as_str())
+                    .map(str::to_owned);
+            }
             if value["request_id"].as_u64() == Some(id) {
                 if value["error"]
                     .as_str()
@@ -234,9 +261,53 @@ impl Drop for Engine {
     }
 }
 
+fn playback_failed(
+    idle: bool,
+    end_reason: Option<&str>,
+    since_load: Duration,
+    seen_audio: bool,
+) -> bool {
+    if !idle {
+        return false;
+    }
+    if end_reason == Some("error") {
+        return true;
+    }
+    // mpv stays idle for a moment after loadfile while the URL opens.
+    // That gap is not a failed download.
+    !seen_audio && since_load >= Duration::from_secs(15)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_while_opening_is_not_a_failed_download() {
+        assert!(!playback_failed(
+            true,
+            None,
+            Duration::from_millis(500),
+            false
+        ));
+        assert!(!playback_failed(
+            true,
+            Some("stop"),
+            Duration::from_secs(20),
+            true
+        ));
+        assert!(!playback_failed(
+            false,
+            Some("error"),
+            Duration::ZERO,
+            false
+        ));
+        assert!(playback_failed(
+            true,
+            Some("error"),
+            Duration::from_millis(100),
+            false
+        ));
+        assert!(playback_failed(true, None, Duration::from_secs(15), false));
+    }
     #[test]
     #[ignore = "Internal fixture used by the owner-exit test"]
     fn lifecycle_owner_fixture() {
