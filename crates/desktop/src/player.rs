@@ -452,13 +452,37 @@ mod tests {
         }
         panic!("mpv survived its owner process");
     }
+    fn live_service_refusal(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("429") || lower.contains("po token") || lower.contains("visitor data")
+    }
+    #[test]
+    fn live_resolve_refusal_is_a_skip_not_a_player_failure() {
+        assert!(live_service_refusal(
+            "YouTube отклонил запрос потока (429 или проверка PO Token). Это отказ сервиса; повтор сразу не выполняется."
+        ));
+        assert!(live_service_refusal(
+            "Missing required Visitor Data/GVS PO Token"
+        ));
+        assert!(!live_service_refusal("Аудиопоток отсутствует"));
+    }
     #[tokio::test]
     #[ignore = "requires network access, yt-dlp, Deno, mpv and an audio device"]
     async fn real_stream_play_pause_seek() {
-        let stream = rustmusic_core::Resolver::new(None)
+        let resolved = rustmusic_core::Resolver::new(None)
             .resolve("4D7u5KF7SP8", false)
-            .await
-            .unwrap();
+            .await;
+        let stream = match resolved {
+            Ok(stream) => stream,
+            Err(error) => {
+                let message = error.to_string();
+                if live_service_refusal(&message) {
+                    eprintln!("live stream skipped: service refused the resolve");
+                    return;
+                }
+                panic!("resolve failed: {message}");
+            }
+        };
         let player = Player::default();
         player.set_epoch(1);
         player.load(stream, 1).await.unwrap();

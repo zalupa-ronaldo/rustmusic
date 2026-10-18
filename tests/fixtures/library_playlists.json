@@ -1,0 +1,53 @@
+{
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "gridRenderer": {
+                      "items": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "title": { "runs": [{ "text": "New playlist" }] },
+                            "navigationEndpoint": { "createPlaylistEndpoint": { "hack": true } }
+                          }
+                        },
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "title": {
+                              "runs": [
+                                {
+                                  "text": "Fixture playlist",
+                                  "navigationEndpoint": {
+                                    "browseEndpoint": { "browseId": "VLPLFIXTURE0001" }
+                                  }
+                                }
+                              ]
+                            },
+                            "subtitle": { "runs": [{ "text": "5 songs" }] }
+                          }
+                        },
+                        {
+                          "continuationItemRenderer": {
+                            "continuationEndpoint": {
+                              "continuationCommand": { "token": "continuation-fixture" }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "menu": { "continuationCommand": { "token": "wrong-token" } }
+}

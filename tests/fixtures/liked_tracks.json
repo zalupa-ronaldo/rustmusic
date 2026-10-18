@@ -1,0 +1,46 @@
+{
+  "contents": {
+    "twoColumnBrowseResultsRenderer": {
+      "secondaryContents": {
+        "sectionListRenderer": {
+          "contents": [
+            {
+              "musicPlaylistShelfRenderer": {
+                "contents": [
+                  {
+                    "musicResponsiveListItemRenderer": {
+                      "flexColumns": [
+                        {
+                          "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{ "text": "Fixture liked" }] }
+                          }
+                        },
+                        {
+                          "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": { "runs": [{ "text": "Fixture artist" }] }
+                          }
+                        }
+                      ],
+                      "playlistItemData": {
+                        "videoId": "abcdefghijk",
+                        "playlistSetVideoId": "set-fixture-1"
+                      },
+                      "lengthText": { "runs": [{ "text": "3:21" }] }
+                    }
+                  },
+                  {
+                    "continuationItemRenderer": {
+                      "continuationEndpoint": {
+                        "continuationCommand": { "token": "liked-continuation-fixture" }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

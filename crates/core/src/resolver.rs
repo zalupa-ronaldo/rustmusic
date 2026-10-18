@@ -140,12 +140,8 @@ fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
         None => Vec::new(),
     }
 }
-fn format_selector(browser: bool) -> &'static str {
-    if browser {
-        "bestaudio[protocol^=http][ext=m4a]/bestaudio[protocol^=http][ext=webm]/bestaudio[protocol^=http]/bestaudio[ext=m4a]/bestaudio"
-    } else {
-        "bestaudio[protocol^=http]/bestaudio"
-    }
+fn format_selector(_browser: bool) -> &'static str {
+    "bestaudio[protocol^=http][ext=m4a]/bestaudio[protocol^=http][ext=webm]/bestaudio[protocol^=http]/bestaudio"
 }
 const MEMORY_CACHE_LIMIT: usize = 16;
 #[derive(Clone)]
@@ -248,27 +244,23 @@ impl Resolver {
         }
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|_| anyhow::anyhow!(public_tool_error(&output.stderr)))?;
-        let url = value["url"]
-            .as_str()
-            .context("Аудиопоток отсутствует")?
-            .to_owned();
-        validate_stream_url(&url)?;
         let mut headers = HashMap::new();
         if let Some(object) = value["http_headers"].as_object() {
-            for (key, value) in object {
-                if let Some(text) = value.as_str()
+            for (key, header) in object {
+                if let Some(text) = header.as_str()
                     && forward_header(key)
                 {
                     headers.insert(key.clone(), text.into());
                 }
             }
         }
-        let mime = match value["ext"].as_str().unwrap_or("") {
-            "m4a" => "audio/mp4",
-            "webm" => "audio/webm",
-            _ => "application/octet-stream",
+        let choices = audio_choices(&value);
+        if choices.is_empty() {
+            bail!("Аудиопоток отсутствует");
         }
-        .into();
+        let chosen = open_audio_choice(&choices, &headers).await?;
+        let url = chosen.url;
+        let mime = chosen.mime;
         let ttl = stream_ttl(&url);
         let stream = Stream {
             url,
@@ -346,6 +338,9 @@ fn forward_header(name: &str) -> bool {
 }
 fn public_tool_error(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
+    if service_refusal(&text) {
+        return "YouTube отклонил запрос потока (429 или проверка PO Token). Это отказ сервиса; повтор сразу не выполняется.".into();
+    }
     let mut kept = Vec::new();
     for line in text.lines() {
         if line_has_secret(line) {
@@ -367,6 +362,136 @@ fn public_tool_error(stderr: &[u8]) -> String {
     } else {
         format!("Не удалось получить аудиопоток. {detail}")
     }
+}
+fn service_refusal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("http error 429")
+        || lower.contains("too many requests")
+        || lower.contains("po token")
+        || lower.contains("visitor data")
+}
+#[derive(Clone)]
+struct AudioChoice {
+    url: String,
+    mime: String,
+    rank: u8,
+}
+fn audio_rank(itag: Option<u64>, ext: &str) -> u8 {
+    match itag {
+        Some(140) => 0,
+        Some(251) => 1,
+        Some(250) => 2,
+        Some(249) => 3,
+        Some(139) => 4,
+        _ if ext == "m4a" => 5,
+        _ if ext == "webm" => 6,
+        _ => 7,
+    }
+}
+fn audio_choices(value: &Value) -> Vec<AudioChoice> {
+    let mut choices = Vec::new();
+    if let Some(formats) = value.get("formats").and_then(Value::as_array) {
+        for format in formats {
+            let Some(url) = format.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            if validate_stream_url(url).is_err() {
+                continue;
+            }
+            let protocol = format
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("https");
+            if !protocol.starts_with("http") {
+                continue;
+            }
+            let acodec = format.get("acodec").and_then(Value::as_str).unwrap_or("");
+            if acodec.is_empty() || acodec == "none" {
+                continue;
+            }
+            let ext = format.get("ext").and_then(Value::as_str).unwrap_or("");
+            let itag = format.get("itag").and_then(Value::as_u64);
+            choices.push(AudioChoice {
+                url: url.to_owned(),
+                mime: mime_for(ext),
+                rank: audio_rank(itag, ext),
+            });
+        }
+    }
+    if choices.is_empty()
+        && let Some(url) = value.get("url").and_then(Value::as_str)
+        && validate_stream_url(url).is_ok()
+    {
+        let ext = value.get("ext").and_then(Value::as_str).unwrap_or("");
+        choices.push(AudioChoice {
+            url: url.to_owned(),
+            mime: mime_for(ext),
+            rank: audio_rank(None, ext),
+        });
+    }
+    choices.sort_by(|left, right| left.rank.cmp(&right.rank).then(left.url.cmp(&right.url)));
+    choices.dedup_by(|left, right| left.url == right.url);
+    choices.truncate(3);
+    choices
+}
+fn mime_for(ext: &str) -> String {
+    match ext {
+        "m4a" => "audio/mp4",
+        "webm" => "audio/webm",
+        _ => "application/octet-stream",
+    }
+    .into()
+}
+enum Probe {
+    Open,
+    Denied,
+    Inconclusive,
+}
+fn interpret_probe(status: u16) -> Probe {
+    match status {
+        200 | 206 => Probe::Open,
+        401 | 403 => Probe::Denied,
+        _ => Probe::Inconclusive,
+    }
+}
+async fn open_audio_choice(
+    choices: &[AudioChoice],
+    headers: &HashMap<String, String>,
+) -> Result<AudioChoice> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let host = attempt.url().host_str().unwrap_or("");
+            if host.ends_with(".googlevideo.com") {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .context("Не удалось проверить аудиопоток")?;
+    let mut denied = 0;
+    let mut checked = 0;
+    for choice in choices {
+        let mut request = client.get(&choice.url).header("range", "bytes=0-1");
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let status = match request.send().await {
+            Ok(response) => response.status().as_u16(),
+            Err(_) => break,
+        };
+        checked += 1;
+        match interpret_probe(status) {
+            Probe::Open => return Ok(choice.clone()),
+            Probe::Denied => denied += 1,
+            Probe::Inconclusive => {}
+        }
+    }
+    if denied > 0 && denied == checked {
+        bail!("YouTube отказал в доступе к аудиопотоку (403). Повторять тот же адрес не нужно.");
+    }
+    choices.first().cloned().context("Аудиопоток отсутствует")
 }
 fn runtime_missing(stderr: &[u8]) -> bool {
     String::from_utf8_lossy(stderr)
@@ -621,9 +746,34 @@ mod tests {
     #[test]
     fn direct_http_audio_is_preferred() {
         assert!(format_selector(false).starts_with("bestaudio[protocol^=http]"));
+        assert!(format_selector(false).contains("[ext=m4a]"));
         assert!(format_selector(true).contains("ext=m4a"));
         assert!(forward_header("User-Agent"));
         assert!(!forward_header("Cookie"));
+    }
+    #[test]
+    fn a_403_candidate_is_not_preferred_over_m4a_or_webm() {
+        let value = serde_json::json!({
+            "formats": [
+                {"url":"https://rr1---sn.googlevideo.com/videoplayback?id=webm","protocol":"https","acodec":"opus","ext":"webm","itag":251},
+                {"url":"https://rr2---sn.googlevideo.com/videoplayback?id=m4a","protocol":"https","acodec":"mp4a.40.2","ext":"m4a","itag":140},
+                {"url":"https://rr3---sn.googlevideo.com/videoplayback?id=video","protocol":"https","acodec":"none","ext":"mp4","itag":18},
+                {"url":"http://rr1---sn.googlevideo.com/videoplayback?id=plain","protocol":"http","acodec":"mp4a","ext":"m4a","itag":140}
+            ]
+        });
+        let choices = audio_choices(&value);
+        assert_eq!(choices.len(), 2);
+        assert!(choices[0].url.contains("id=m4a"));
+        assert_eq!(choices[0].mime, "audio/mp4");
+        assert!(choices[1].url.contains("id=webm"));
+        assert!(matches!(interpret_probe(206), Probe::Open));
+        assert!(matches!(interpret_probe(403), Probe::Denied));
+        let message = public_tool_error(
+            b"ERROR: [youtube] Missing required Visitor Data/GVS PO Token\nHTTP Error 429: Too Many Requests\n",
+        );
+        assert!(message.contains("429"));
+        assert!(message.contains("PO Token"));
+        assert!(!message.contains("youtube"));
     }
     #[tokio::test]
     async fn failed_open_invalidates_the_url_and_drops_the_partial() {

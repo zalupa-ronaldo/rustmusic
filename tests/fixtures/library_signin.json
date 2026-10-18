@@ -1,0 +1,44 @@
+{
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "itemSectionRenderer": {
+                      "contents": [
+                        {
+                          "messageRenderer": {
+                            "text": {
+                              "runs": [{ "text": "Looking for liked tracks fixture" }]
+                            },
+                            "button": {
+                              "buttonRenderer": {
+                                "text": { "runs": [{ "text": "Sign in" }] },
+                                "navigationEndpoint": { "signInEndpoint": { "hack": true } }
+                              }
+                            },
+                            "subtext": {
+                              "messageSubtextRenderer": {
+                                "text": {
+                                  "runs": [{ "text": "Sign in to listen to your liked tracks" }]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
