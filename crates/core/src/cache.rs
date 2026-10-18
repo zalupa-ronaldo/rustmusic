@@ -3,7 +3,7 @@ use crate::{Stream, resolver::validate_stream_url, valid_video_id};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -152,6 +152,10 @@ struct CacheInner {
 struct State {
     index: Index,
     active: HashSet<String>,
+    /// Generation of the download currently allowed to commit. `discard` removes
+    /// the entry so a response that arrives after a failed open cannot be stored.
+    inflight: HashMap<String, u64>,
+    next_generation: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Index {
@@ -178,6 +182,8 @@ impl TrackCache {
         let mut state = State {
             index,
             active: HashSet::new(),
+            inflight: HashMap::new(),
+            next_generation: 1,
         };
         evict(&canonical, &mut state.index, config.limit_bytes, "");
         save_index(&canonical, &state.index)?;
@@ -251,6 +257,10 @@ impl TrackCache {
         path.canonicalize().ok()
     }
     /// Download a played stream after playback has already started.
+    ///
+    /// The URL is the one `Resolver` already produced with the shared yt-dlp and
+    /// Deno lookup. This client only fetches that URL, so a missing JavaScript
+    /// runtime never reaches the disk cache as a 403.
     pub fn remember(&self, id: &str, stream: Stream) {
         if self.inner.limit_bytes == 0
             || !valid_video_id(id)
@@ -259,30 +269,64 @@ impl TrackCache {
             return;
         }
         let ext = extension_for(&stream.mime);
-        {
-            let mut state = lock(&self.inner.state);
-            if state.index.entries.iter().any(|entry| entry.id == id)
-                || !state.active.insert(id.to_owned())
-            {
-                return;
-            }
-        }
+        let Some(generation) = self.start_download(id) else {
+            return;
+        };
         let cache = self.clone();
         let id = id.to_owned();
         tokio::spawn(async move {
-            let partial = cache.partial_path(&id, ext);
             let outcome = cache
-                .download_url(&stream.url, &stream.headers, &partial, cache.max_track())
+                .download_url(
+                    &stream.url,
+                    &stream.headers,
+                    &cache.partial_path(&id, ext),
+                    cache.max_track(),
+                )
                 .await;
-            let stored = match outcome {
-                Ok(bytes) => cache.commit_file(&id, ext, &partial, bytes).is_ok(),
-                Err(_) => false,
-            };
-            if !stored {
-                let _ = fs::remove_file(partial);
-            }
-            lock(&cache.inner.state).active.remove(&id);
+            cache.settle(&id, ext, generation, outcome);
         });
+    }
+    /// Forget an in-flight download and delete its partial file.
+    pub fn discard(&self, id: &str) {
+        if !valid_video_id(id) {
+            return;
+        }
+        {
+            let mut state = lock(&self.inner.state);
+            state.inflight.remove(id);
+            state.active.remove(id);
+        }
+        for ext in ALLOWED_EXT {
+            let _ = fs::remove_file(self.partial_path(id, ext));
+        }
+    }
+    fn start_download(&self, id: &str) -> Option<u64> {
+        let mut state = lock(&self.inner.state);
+        if state.index.entries.iter().any(|entry| entry.id == id) || state.active.contains(id) {
+            return None;
+        }
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.wrapping_add(1);
+        state.inflight.insert(id.to_owned(), generation);
+        state.active.insert(id.to_owned());
+        Some(generation)
+    }
+    fn settle(&self, id: &str, ext: &str, generation: u64, outcome: Result<u64>) {
+        let partial = self.partial_path(id, ext);
+        let stored = match outcome {
+            Ok(bytes) => self
+                .commit_file(id, ext, &partial, bytes, Some(generation))
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !stored {
+            let _ = fs::remove_file(&partial);
+        }
+        let mut state = lock(&self.inner.state);
+        if state.inflight.get(id).copied() == Some(generation) {
+            state.inflight.remove(id);
+            state.active.remove(id);
+        }
     }
     fn max_track(&self) -> u64 {
         self.inner.limit_bytes.min(MAX_TRACK_BYTES)
@@ -323,15 +367,29 @@ impl TrackCache {
         file.sync_all().await?;
         Ok(total)
     }
-    fn commit_file(&self, id: &str, ext: &str, partial: &Path, bytes: u64) -> Result<()> {
+    fn commit_file(
+        &self,
+        id: &str,
+        ext: &str,
+        partial: &Path,
+        bytes: u64,
+        generation: Option<u64>,
+    ) -> Result<bool> {
         if bytes == 0 || bytes > self.max_track() || self.inner.limit_bytes == 0 {
             let _ = fs::remove_file(partial);
-            return Ok(());
+            return Ok(false);
         }
         let name = format!("{id}.{ext}");
         let final_path = self.inner.canonical.join(&name);
-        replace_file(partial, &final_path)?;
         let mut state = lock(&self.inner.state);
+        if let Some(generation) = generation
+            && state.inflight.get(id).copied() != Some(generation)
+        {
+            drop(state);
+            let _ = fs::remove_file(partial);
+            return Ok(false);
+        }
+        replace_file(partial, &final_path)?;
         state.index.entries.retain(|entry| entry.id != id);
         state.index.clock = state.index.clock.saturating_add(1);
         let used = state.index.clock;
@@ -348,7 +406,13 @@ impl TrackCache {
             id,
         );
         save_index(&self.inner.canonical, &state.index)?;
-        Ok(())
+        if let Some(generation) = generation
+            && state.inflight.get(id).copied() == Some(generation)
+        {
+            state.inflight.remove(id);
+            state.active.remove(id);
+        }
+        Ok(true)
     }
     #[cfg(test)]
     fn store_bytes(&self, id: &str, ext: &str, data: &[u8]) -> Result<()> {
@@ -363,8 +427,15 @@ impl TrackCache {
         }
         let partial = self.partial_path(id, ext);
         fs::write(&partial, data)?;
-        self.commit_file(id, ext, &partial, data.len() as u64)
+        self.commit_file(id, ext, &partial, data.len() as u64, None)?;
+        Ok(())
     }
+}
+/// Drop the resolved URL after playback fails to open it, and delete the partial
+/// download so a late response cannot become a cached track.
+pub async fn clear_failed_open(resolver: &crate::Resolver, cache: &TrackCache, id: &str) {
+    resolver.invalidate(id).await;
+    cache.discard(id);
 }
 fn extension_for(mime: &str) -> &'static str {
     match mime {
@@ -615,9 +686,11 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        cache
-            .commit_file("abcdefghijk", "m4a", &partial, bytes)
-            .unwrap();
+        assert!(
+            cache
+                .commit_file("abcdefghijk", "m4a", &partial, bytes, None)
+                .unwrap()
+        );
         let path = cache.lookup("abcdefghijk").unwrap();
         assert_eq!(fs::read(path).unwrap(), body);
     }
@@ -635,5 +708,29 @@ mod tests {
         );
         assert!(cache.lookup("abcdefghijk").is_none());
         assert!(lock(&cache.inner.state).active.is_empty());
+    }
+    #[test]
+    fn failed_download_does_not_leave_a_partial_file() {
+        let (dir, cache) = open_limited(10_000);
+        let partial = dir.path().join("abcdefghijk.m4a.partial");
+        fs::write(&partial, b"partial").unwrap();
+        cache.settle("abcdefghijk", "m4a", 1, Err(anyhow::anyhow!("open failed")));
+        assert!(!partial.exists());
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
+    }
+    #[test]
+    fn discard_rejects_a_late_download() {
+        let (dir, cache) = open_limited(10_000);
+        let generation = cache.start_download("abcdefghijk").unwrap();
+        let partial = cache.partial_path("abcdefghijk", "m4a");
+        fs::write(&partial, b"partial").unwrap();
+        cache.discard("abcdefghijk");
+        assert!(!partial.exists());
+        fs::write(&partial, b"late").unwrap();
+        cache.settle("abcdefghijk", "m4a", generation, Ok(4));
+        assert!(!partial.exists());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
+        assert!(cache.lookup("abcdefghijk").is_none());
     }
 }

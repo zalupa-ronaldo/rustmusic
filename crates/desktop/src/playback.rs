@@ -157,6 +157,7 @@ pub async fn start(
         return Ok(StartKind::Stale);
     }
     player.load(stream.clone(), epoch).await?;
+    // The URL was resolved with the shared yt-dlp and Deno paths.
     cache.remember(video_id, stream);
     prefetch_next(playback, player, resolver, next_id, epoch);
     Ok(StartKind::Network)
