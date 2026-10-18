@@ -65,7 +65,7 @@ a {
   display: grid;
   grid-template-columns: 238px 1fr;
   min-height: 100vh;
-  padding-bottom: 112px;
+  padding-bottom: 128px;
 }
 aside {
   position: fixed;
@@ -129,17 +129,76 @@ nav button.active {
 }
 .queue-item {
   display: flex;
+  align-items: center;
   text-align: left;
-  gap: 10px;
+  gap: 6px;
   background: transparent;
   width: 100%;
-  padding: 10px 8px;
+  padding: 4px 6px;
 }
-.queue-item > span:first-child {
+.queue-item button {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 10px;
+  background: transparent;
+  text-align: left;
+  padding: 6px 4px;
+}
+.queue-item button:hover {
+  background: transparent;
+}
+.queue-item button > span:first-child {
   color: var(--accent);
 }
-.queue-item > span:last-child {
+.queue-item button > span:last-child {
   overflow: hidden;
+}
+.drag-handle {
+  cursor: grab;
+  color: var(--muted);
+  user-select: none;
+  padding: 4px 2px;
+  letter-spacing: -1px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.drop-target {
+  outline: 1px dashed var(--accent);
+  background: #2a1c24;
+}
+.build-label {
+  padding-left: 10px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+}
+.download {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid #3c3f50;
+  background: #1b1d26;
+  color: #d7d9e2;
+  font-size: 12px;
+  padding: 0;
+  flex-shrink: 0;
+  line-height: 26px;
+}
+.download.ready {
+  color: #7dcea0;
+  border-color: #3d6b52;
+}
+.download.failed {
+  color: #ff8589;
+  border-color: #6b3d42;
+}
+.download.active {
+  background: conic-gradient(
+    var(--accent) calc(var(--p) * 1%),
+    #1b1d26 0
+  );
+  border-color: transparent;
 }
 .queue-item strong,
 .queue-item small {
@@ -450,7 +509,7 @@ footer {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 112px;
+  height: 128px;
   background: #191b23;
   border-top: 1px solid var(--line);
   display: grid;
@@ -500,6 +559,22 @@ footer {
   font-size: 11px;
   color: var(--muted);
   margin-top: 6px;
+}
+.now-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.now-actions button {
+  background: transparent;
+  color: #c9ccd6;
+  padding: 0 6px;
+  min-width: 28px;
+  height: 26px;
+  font-size: 13px;
+}
+.now-actions button:hover {
+  background: #2a2c36;
 }
 .transport {
   max-width: 650px;

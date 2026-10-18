@@ -13,7 +13,11 @@
   index rebuild, and cache-hit lookup staying under a network-resolve budget.
 - Stream URL expiry bounds and in-memory descriptor eviction.
 - Playback planning stops the current track before a resolve and skips the
-  resolve when the track is already cached.
+  resolve when the track is already cached or pinned as an explicit download.
+- Cover-art host allowlist, image cache LRU, and pinned-download files staying
+  in place when the playback cache is opened on the same directory.
+- Queue reorder keeps the current track; playlist reorder names the following
+  row. Build label is a short commit hash, with `-dirty` only as a flag.
 - Expired/forbidden sessions (401/403), service failures, malformed responses
   and connection failures against an isolated local fixture server.
 - Cancellation terminates forked resolver children, not just their parent.
@@ -37,7 +41,12 @@ For account validation, connect your session through settings and check:
 3. Playback, seek, next/previous, repeat, shuffle, queue and macOS media keys.
 4. Create a **temporary private test playlist**, add two tracks, rename it,
    move/remove a track, refresh to verify persistence, then delete it.
-5. Like/unlike a chosen test track and verify on music.youtube.com.
+5. Like/unlike a chosen test track and verify on music.youtube.com. Dislike
+   the same track and confirm the rating there. Use «Следующим» and drag the
+   queue. Drag two tracks in a temporary playlist and refresh music.youtube.com
+   to confirm the order. Download a track, see the progress and the check mark,
+   quit the app, and play that track with the network disabled. The sidebar
+   shows the version and a short commit hash.
 6. Disconnect, relaunch, confirm credentials are removed; expired cookies
    produce a reconnect prompt. Cancel browser Keychain access and try manual import.
    On macOS the session is a login-keychain item written by `/usr/bin/security`,

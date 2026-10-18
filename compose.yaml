@@ -1,6 +1,10 @@
 services:
   rustmusic:
-    build: .
+    build:
+      context: .
+      args:
+        RUSTMUSIC_COMMIT: ${RUSTMUSIC_COMMIT:-unknown}
+        RUSTMUSIC_DIRTY: ${RUSTMUSIC_DIRTY:-}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

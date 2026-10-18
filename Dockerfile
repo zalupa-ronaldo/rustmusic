@@ -12,6 +12,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY tests/ tests/
 ARG TARGETPLATFORM
+ARG RUSTMUSIC_COMMIT=unknown
+ARG RUSTMUSIC_DIRTY=
+ENV RUSTMUSIC_COMMIT=${RUSTMUSIC_COMMIT}
+ENV RUSTMUSIC_DIRTY=${RUSTMUSIC_DIRTY}
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=rustmusic-target-${TARGETPLATFORM},target=/build/target CARGO_BUILD_JOBS=2 cargo build --locked --release -p rustmusic-server && cp target/release/rustmusic-server /build/rustmusic-server
 
 FROM denoland/deno:bin-2.7.5 AS deno

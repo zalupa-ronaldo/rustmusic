@@ -248,7 +248,10 @@ impl TrackCache {
         }) && contained(&self.inner.canonical, &path);
         if !fresh {
             let entry = state.index.entries.remove(position);
-            let _ = fs::remove_file(self.inner.canonical.join(entry.name));
+            remove_cache_file(
+                &self.inner.canonical,
+                &self.inner.canonical.join(entry.name),
+            );
             let _ = save_index(&self.inner.canonical, &state.index);
             return None;
         }
@@ -294,6 +297,12 @@ impl TrackCache {
         if !valid_video_id(id) {
             return;
         }
+        if protects_pinned(&self.inner.canonical) {
+            let mut state = lock(&self.inner.state);
+            state.inflight.remove(id);
+            state.active.remove(id);
+            return;
+        }
         let removed = {
             let mut state = lock(&self.inner.state);
             state.inflight.remove(id);
@@ -326,6 +335,9 @@ impl TrackCache {
             state.inflight.remove(id);
             state.active.remove(id);
         }
+        if protects_pinned(&self.inner.canonical) {
+            return;
+        }
         for ext in ALLOWED_EXT {
             let _ = fs::remove_file(self.partial_path(id, ext));
         }
@@ -350,7 +362,7 @@ impl TrackCache {
             Err(_) => false,
         };
         if !stored {
-            let _ = fs::remove_file(&partial);
+            remove_cache_file(&self.inner.canonical, &partial);
         }
         let mut state = lock(&self.inner.state);
         if state.inflight.get(id).copied() == Some(generation) {
@@ -405,6 +417,9 @@ impl TrackCache {
         bytes: u64,
         generation: Option<u64>,
     ) -> Result<bool> {
+        if protects_pinned(&self.inner.canonical) {
+            return Ok(false);
+        }
         if bytes == 0
             || bytes > self.max_track()
             || self.inner.limit_bytes == 0
@@ -542,7 +557,18 @@ fn reconcile(directory: &Path, mut index: Index) -> Index {
     }
     index
 }
+fn protects_pinned(directory: &Path) -> bool {
+    directory.join(".rustmusic-pinned").is_file()
+}
+fn remove_cache_file(directory: &Path, path: &Path) {
+    if !protects_pinned(directory) {
+        let _ = fs::remove_file(path);
+    }
+}
 fn read_audio(directory: &Path) -> Vec<(String, String, u64)> {
+    if protects_pinned(directory) {
+        return Vec::new();
+    }
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -572,6 +598,9 @@ fn read_audio(directory: &Path) -> Vec<(String, String, u64)> {
     files
 }
 fn evict(directory: &Path, index: &mut Index, limit: u64, protect: &str) {
+    if protects_pinned(directory) {
+        return;
+    }
     loop {
         let total: u64 = index.entries.iter().map(|entry| entry.bytes).sum();
         if total <= limit {
@@ -815,5 +844,43 @@ mod tests {
         assert!(!partial.exists());
         assert!(!dir.path().join("abcdefghijk.m4a").exists());
         assert!(cache.lookup("abcdefghijk").is_none());
+    }
+    #[test]
+    fn pinned_marker_blocks_adoption_overwrite_and_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rustmusic-pinned"),
+            b"rustmusic-downloads\n",
+        )
+        .unwrap();
+        let pinned = dir.path().join("abcdefghijk.m4a");
+        fs::write(&pinned, [9; 80]).unwrap();
+        fs::write(dir.path().join("abcdefghijk.m4a.partial"), b"partial").unwrap();
+        let cache = TrackCache::open(CacheConfig {
+            directory: dir.path().to_path_buf(),
+            limit_bytes: 10,
+        })
+        .unwrap();
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert_eq!(fs::read(&pinned).unwrap(), vec![9; 80]);
+        assert_eq!(
+            fs::read(dir.path().join("abcdefghijk.m4a.partial")).unwrap(),
+            b"partial"
+        );
+        cache.store_bytes("bbbbbbbbbbb", "m4a", &[1; 40]).unwrap();
+        assert!(cache.lookup("bbbbbbbbbbb").is_none());
+        assert!(!dir.path().join("bbbbbbbbbbb.m4a").exists());
+        assert_eq!(fs::read(&pinned).unwrap(), vec![9; 80]);
+        cache.discard("abcdefghijk");
+        assert_eq!(
+            fs::read(dir.path().join("abcdefghijk.m4a.partial")).unwrap(),
+            b"partial"
+        );
+        cache.purge("abcdefghijk");
+        assert_eq!(fs::read(&pinned).unwrap(), vec![9; 80]);
+        assert_eq!(
+            fs::read(dir.path().join("abcdefghijk.m4a.partial")).unwrap(),
+            b"partial"
+        );
     }
 }

@@ -15,7 +15,8 @@ use axum::{
     routing::{get, post},
 };
 use rustmusic_core::{
-    Item, ItemKind, MusicClient, Mutation, Page, Queue, Repeat, Resolver, Session, valid_video_id,
+    ArtCache, DownloadStore, Item, ItemKind, MusicClient, Mutation, Page, Queue, Repeat, Resolver,
+    Session, app_commit, app_version, http_byte_range, valid_video_id,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,6 +39,8 @@ struct Inner {
     events: broadcast::Sender<String>,
     http: reqwest::Client,
     queue: RwLock<Queue>,
+    art: ArtCache,
+    downloads: DownloadStore,
 }
 struct ApiError(String);
 impl From<anyhow::Error> for ApiError {
@@ -120,10 +123,16 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
         )
             .into_response();
     }
+    let path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
+    let cache_control = if path.starts_with("/api/v1/art") {
+        "public, max-age=604800"
+    } else {
+        "no-store"
+    };
     response
         .headers_mut()
-        .insert("cache-control", HeaderValue::from_static("no-store"));
+        .insert("cache-control", HeaderValue::from_static(cache_control));
     response
 }
 #[derive(Deserialize)]
@@ -173,7 +182,7 @@ async fn status(State(app): State<App>) -> Result<Json<Value>> {
         None
     };
     Ok(Json(
-        json!({"account":account,"version":env!("CARGO_PKG_VERSION")}),
+        json!({"account":account,"version":app_version(),"commit":app_commit()}),
     ))
 }
 #[derive(Deserialize)]
@@ -277,6 +286,13 @@ enum QueueCommand {
     Previous,
     Shuffle,
     Repeat,
+    Reorder {
+        from: usize,
+        to: usize,
+    },
+    InsertNext {
+        item: Item,
+    },
 }
 async fn queue_get(State(app): State<App>) -> Json<Queue> {
     Json(app.inner.queue.read().await.clone())
@@ -333,10 +349,25 @@ async fn queue_post(
                 Repeat::One => Repeat::Off,
             }
         }
+        QueueCommand::Reorder { from, to } => {
+            if from >= queue.items.len() || to >= queue.items.len() {
+                return Err(ApiError("Трек отсутствует в очереди".into()));
+            }
+            queue.reorder(from, to);
+        }
+        QueueCommand::InsertNext { item } => {
+            check(&item)?;
+            if !queue.insert_next(item) {
+                return Err(ApiError("Очередь заполнена".into()));
+            }
+        }
     }
     Ok(Json(queue.clone()))
 }
 async fn resolve(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>> {
+    if app.inner.downloads.lookup(&id).is_some() {
+        return Ok(Json(json!({"url":format!("/api/v1/audio/{id}")})));
+    }
     let resolver = app.inner.resolver.read().await.clone();
     let _ = app.inner.events.send("Получение аудиопотока".into());
     resolver.resolve(&id, true).await?;
@@ -348,6 +379,9 @@ async fn audio(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    if let Some(path) = app.inner.downloads.lookup(&id) {
+        return serve_download(path, &headers).await;
+    }
     let resolver = app.inner.resolver.read().await.clone();
     let stream = resolver.resolve(&id, true).await?;
     let mut request = app.inner.http.get(&stream.url);
@@ -384,6 +418,131 @@ async fn audio(
         .map_err(anyhow::Error::from)?;
     Ok(response)
 }
+async fn serve_download(path: PathBuf, headers: &HeaderMap) -> Result<Response> {
+    let file_len = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError("Скачанный файл недоступен".into()))?
+        .len();
+    let mime = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("m4a") => "audio/mp4",
+        Some("webm") => "audio/webm",
+        Some("ogg") => "audio/ogg",
+        Some("mp3") => "audio/mpeg",
+        _ => "application/octet-stream",
+    };
+    if file_len == 0 {
+        return Ok(Response::builder()
+            .header("content-type", mime)
+            .header("content-length", "0")
+            .header("accept-ranges", "bytes")
+            .body(Body::empty())
+            .unwrap());
+    }
+    let requested = headers.get("range").and_then(|value| value.to_str().ok());
+    let selection = match http_byte_range(requested, file_len) {
+        Ok(selection) => selection,
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("content-range", format!("bytes */{file_len}"))
+                .body(Body::empty())
+                .unwrap());
+        }
+    };
+    let (start, end) = selection.unwrap_or((0, file_len - 1));
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError("Скачанный файл недоступен".into()))?;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|_| ApiError("Скачанный файл недоступен".into()))?;
+    let mut buf = vec![0u8; (end - start + 1) as usize];
+    file.read_exact(&mut buf)
+        .await
+        .map_err(|_| ApiError("Скачанный файл недоступен".into()))?;
+    let status = if selection.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", mime)
+        .header("content-length", buf.len().to_string())
+        .header("accept-ranges", "bytes");
+    if selection.is_some() {
+        builder = builder.header("content-range", format!("bytes {start}-{end}/{file_len}"));
+    }
+    Ok(builder.body(Body::from(buf)).unwrap())
+}
+#[derive(Deserialize)]
+struct ArtQuery {
+    url: String,
+}
+async fn artwork(State(app): State<App>, Query(query): Query<ArtQuery>) -> Result<Response> {
+    let bytes = app.inner.art.load(&query.url).await?;
+    let mime = rustmusic_core::art::image_kind(&bytes).unwrap_or("application/octet-stream");
+    Ok(Response::builder()
+        .header("content-type", mime)
+        .body(Body::from(bytes))
+        .unwrap())
+}
+async fn download_start(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>> {
+    if !valid_video_id(&id) {
+        return Err(ApiError("Некорректный идентификатор трека".into()));
+    }
+    if app.inner.downloads.lookup(&id).is_some() {
+        return Ok(Json(json!({"state":"ready","progress":100})));
+    }
+    if !app.inner.downloads.reserve(&id) {
+        let progress = match app.inner.downloads.phase(&id) {
+            rustmusic_core::DownloadPhase::Active(value) => value,
+            _ => 0,
+        };
+        return Ok(Json(json!({"state":"active","progress":progress})));
+    }
+    let resolver = app.inner.resolver.read().await.clone();
+    let store = app.inner.downloads.clone();
+    let events = app.inner.events.clone();
+    let video_id = id.clone();
+    tokio::spawn(async move {
+        let _ = events.send("Скачивание трека".into());
+        match resolver.resolve(&video_id, true).await {
+            Ok(stream) => match store.save_stream(&video_id, stream).await {
+                Ok(()) => {
+                    let _ = events.send("Трек скачан".into());
+                }
+                Err(error) => {
+                    let _ = events.send(error.to_string());
+                }
+            },
+            Err(error) => {
+                store.mark_failed(&video_id, error.to_string());
+                let _ = events.send(error.to_string());
+            }
+        }
+    });
+    Ok(Json(json!({"state":"active","progress":0})))
+}
+async fn downloads_status(State(app): State<App>) -> Json<Value> {
+    let items = app
+        .inner
+        .downloads
+        .list()
+        .into_iter()
+        .map(|item| {
+            let state = match item.phase {
+                rustmusic_core::DownloadPhase::Ready => "ready",
+                rustmusic_core::DownloadPhase::Failed => "failed",
+                rustmusic_core::DownloadPhase::Active(_) => "active",
+                rustmusic_core::DownloadPhase::Idle => "idle",
+            };
+            json!({"id":item.id,"state":state,"progress":item.progress})
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"items":items,"bytes":app.inner.downloads.bytes()}))
+}
 async fn events(
     State(app): State<App>,
 ) -> Sse<impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
@@ -403,6 +562,9 @@ fn router(app: App, web: &str) -> Router {
         .route("/mutate", post(mutate))
         .route("/resolve/{id}", post(resolve))
         .route("/audio/{id}", get(audio))
+        .route("/art", get(artwork))
+        .route("/download/{id}", post(download_start))
+        .route("/downloads", get(downloads_status))
         .route("/events", get(events));
     Router::new().nest("/api/v1",api).layer(middleware::from_fn_with_state(app.clone(),guard))
         .fallback_service(ServeDir::new(web).append_index_html_on_directories(true))
@@ -449,6 +611,8 @@ async fn main() -> anyhow::Result<()> {
                 .connect_timeout(Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            art: ArtCache::open(directory.join("covers"))?,
+            downloads: DownloadStore::open(directory.join("downloads"))?,
         }),
     };
     let addr = std::env::var("RUSTMUSIC_LISTEN").unwrap_or("127.0.0.1:8080".into());
@@ -467,6 +631,14 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
     fn app() -> App {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rustmusic-server-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
         let (events, _) = broadcast::channel(4);
         App {
             inner: Arc::new(Inner {
@@ -479,6 +651,8 @@ mod tests {
                 resolver: RwLock::new(Resolver::new(None)),
                 events,
                 http: reqwest::Client::new(),
+                art: ArtCache::open(root.join("covers")).unwrap(),
+                downloads: DownloadStore::open(root.join("downloads")).unwrap(),
             }),
         }
     }
@@ -540,5 +714,76 @@ mod tests {
                 .unwrap()
                 .contains("HttpOnly; SameSite=Strict")
         );
+    }
+    async fn cookie() -> String {
+        let response = router(app(), "web/dist")
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/login")
+                    .header("x-rustmusic", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+    #[tokio::test]
+    async fn serves_a_pinned_download_without_an_upstream() {
+        let application = app();
+        application
+            .inner
+            .downloads
+            .store("abcdefghijk", "m4a", b"offline-audio")
+            .unwrap();
+        let response = router(application, "web/dist")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audio/abcdefghijk")
+                    .header("cookie", cookie().await)
+                    .header("range", "bytes=0-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&bytes[..], b"offline");
+    }
+    #[tokio::test]
+    async fn rejects_artwork_outside_youtube_hosts() {
+        let response = router(app(), "web/dist")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/art?url=https%3A%2F%2Fevil.test%2Fx.jpg")
+                    .header("cookie", cookie().await)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let denied = router(app(), "web/dist")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/downloads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     }
 }
