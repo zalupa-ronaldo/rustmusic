@@ -311,6 +311,11 @@ impl App {
             Message::SessionConnected,
         )
     }
+    fn install_session(&mut self, session: Session) {
+        self.auth_user = session.auth_user.clone();
+        self.client = MusicClient::new(Some(session.clone())).expect("HTTP client");
+        self.resolver = Resolver::new(Some(session));
+    }
     fn media_update(&mut self) {
         #[cfg(target_os = "macos")]
         if let Some(media) = self.media.as_mut() {
@@ -337,8 +342,14 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Boot(Ok(Some(session))) => {
-                self.auth_user = session.auth_user.clone();
-                let client = MusicClient::new(Some(session.clone())).unwrap();
+                // Install the restored cookies before the account probe. A
+                // network or account-menu failure must not drop a session that
+                // was already read from disk.
+                let startup = startup_session(true, false);
+                if startup.active {
+                    self.install_session(session.clone());
+                }
+                let client = self.client.clone();
                 Task::perform(
                     async move { result(client.account().await.map(|a| (session, a))) },
                     Message::SessionConnected,
@@ -353,17 +364,25 @@ impl App {
                 self.connecting = false;
                 match value {
                     Ok((session, account)) => {
-                        self.account = Some(account);
-                        self.client = MusicClient::new(Some(session.clone())).unwrap();
-                        self.resolver = Resolver::new(Some(session));
+                        let startup = startup_session(true, true);
+                        if startup.active {
+                            self.install_session(session);
+                        }
+                        if startup.verified {
+                            self.account = Some(account);
+                        }
                         self.manual.clear();
                         self.settings = false;
                         self.fetch(Route::Home, false)
                     }
                     Err(e) => {
                         self.status = e;
-                        self.settings = true;
-                        Task::none()
+                        if reconnect_prompt(self.client.session().is_some()) {
+                            self.settings = true;
+                            Task::none()
+                        } else {
+                            self.fetch(Route::Home, false)
+                        }
                     }
                 }
             }
@@ -705,7 +724,7 @@ impl App {
                     self.playing = false;
                     self.items.clear();
                     self.covers.clear();
-                    self.status = "Сессия удалена из Keychain".into();
+                    self.status = "Сохранённая сессия удалена".into();
                     self.media_update();
                     self.command(json!(["stop"]))
                 }
@@ -1095,7 +1114,7 @@ impl App {
                 text("Ручной импорт (JSON headers, Cookie или Netscape cookies.txt)"),
                 soft_button("Выбрать файл").on_press(Message::ImportFile),
                 text_input(
-                    "Вставьте сессию; данные сохраняются только в Keychain",
+                    "Вставьте сессию; она сохранится на этом компьютере",
                     &self.manual
                 )
                 .on_input(Message::Manual)
@@ -1111,6 +1130,25 @@ impl App {
         .into()
     }
 }
+struct StartupSession {
+    active: bool,
+    verified: bool,
+}
+
+/// A session read at startup stays active even when the account probe fails.
+/// `verified` is only the display name from YouTube Music.
+fn startup_session(loaded: bool, account_verified: bool) -> StartupSession {
+    StartupSession {
+        active: loaded,
+        verified: loaded && account_verified,
+    }
+}
+
+/// The sign-in screen is the reconnect prompt only when no session is loaded.
+fn reconnect_prompt(session_active: bool) -> bool {
+    !session_active
+}
+
 fn soft_button<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Button<'a, Message> {
     iced::widget::button(content).style(button::secondary)
 }
@@ -1135,4 +1173,20 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .window_size((1180., 800.))
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconnect_prompt, startup_session};
+
+    #[test]
+    fn restored_session_stays_active_when_account_probe_fails() {
+        let startup = startup_session(true, false);
+        assert!(startup.active);
+        assert!(!startup.verified);
+        assert!(!reconnect_prompt(startup.active));
+        let verified = startup_session(true, true);
+        assert!(verified.active && verified.verified);
+        assert!(reconnect_prompt(startup_session(false, true).active));
+    }
 }
