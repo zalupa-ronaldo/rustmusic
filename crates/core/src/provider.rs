@@ -11,6 +11,9 @@ pub struct MusicClient {
     context: Arc<OnceCell<Value>>,
     #[cfg(test)]
     test_base: Option<String>,
+    /// Homepage used to read Innertube config. Tests point this at a local server.
+    #[cfg(test)]
+    page_base: Option<String>,
 }
 impl MusicClient {
     pub fn new(session: Option<Session>) -> Result<Self> {
@@ -18,11 +21,27 @@ impl MusicClient {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(25))
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    let host = attempt.url().host_str().unwrap_or("");
+                    if host == "music.youtube.com"
+                        || host.ends_with(".youtube.com")
+                        || host.ends_with(".googlevideo.com")
+                        || host.ends_with(".ytimg.com")
+                        || host == "127.0.0.1"
+                        || host == "localhost"
+                    {
+                        attempt.follow()
+                    } else {
+                        attempt.stop()
+                    }
+                }))
                 .build()?,
             session,
             context: Arc::new(OnceCell::new()),
             #[cfg(test)]
             test_base: None,
+            #[cfg(test)]
+            page_base: None,
         })
     }
     pub fn session(&self) -> Option<&Session> {
@@ -31,20 +50,44 @@ impl MusicClient {
     pub fn authenticated(&self) -> bool {
         self.session.is_some()
     }
+    fn page_url(&self) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.page_base {
+            return format!("{base}/");
+        }
+        "https://music.youtube.com/".to_owned()
+    }
+    /// Innertube config. A signed-in client must load this page with the session
+    /// cookie: an anonymous `visitorData` makes library browse return the
+    /// signed-out shell even when `account_menu` still shows the account name.
     async fn context(&self) -> Result<Value> {
-        self.context.get_or_try_init(|| async {
-            let page=self.http.get("https://music.youtube.com/").send().await.map_err(|_| anyhow::anyhow!("Не удалось подключиться к YouTube Music"))?.text().await.map_err(|_| anyhow::anyhow!("Не удалось загрузить настройки YouTube Music"))?;
-            for (offset,_) in page.match_indices("ytcfg.set(") {
-                let mut stream=serde_json::Deserializer::from_str(&page[offset+10..]).into_iter::<Value>();
-                if let Some(Ok(config))=stream.next() {
-                    if let Some(context)=config.get("INNERTUBE_CONTEXT") { return Ok(context.clone()); }
-                    if let Some(version)=config.get("INNERTUBE_CLIENT_VERSION").and_then(Value::as_str) {
-                        return Ok(json!({"client":{"clientName":"WEB_REMIX","clientVersion":version,"hl":"ru"},"user":{}}));
-                    }
+        let http = self.http.clone();
+        let page_url = self.page_url();
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let auth_user = self
+            .session
+            .as_ref()
+            .map(|session| session.auth_user.clone());
+        self.context
+            .get_or_try_init(|| async move {
+                let mut request = http.get(&page_url);
+                if let Some(cookie) = &cookie {
+                    request = request.header("cookie", cookie);
                 }
-            }
-            bail!("YouTube Music изменил настройки клиента. Требуется обновление RustMusic.")
-        }).await.cloned()
+                if let Some(auth_user) = &auth_user {
+                    request = request.header("x-goog-authuser", auth_user);
+                }
+                let page = request
+                    .send()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Не удалось подключиться к YouTube Music"))?
+                    .text()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Не удалось загрузить настройки YouTube Music"))?;
+                parse_innertube_context(&page)
+            })
+            .await
+            .cloned()
     }
     pub async fn request(&self, endpoint: &str, mut body: Value) -> Result<Value> {
         let mut context = self.context().await?;
@@ -372,16 +415,20 @@ fn parse_renderer(v: &Value) -> Option<Item> {
     } else {
         text(&v["subtitle"])
     };
-    let browse_id = browse.and_then(|b| b["browseId"].as_str()).or_else(|| {
-        flex.and_then(|c| c.first())
-            .and_then(|c| {
-                find_key(
-                    &c["musicResponsiveListItemFlexColumnRenderer"]["text"],
-                    "browseEndpoint",
-                )
-            })
-            .and_then(|b| b["browseId"].as_str())
-    });
+    let browse_id = browse
+        .and_then(|endpoint| endpoint["browseId"].as_str())
+        .or_else(|| run_browse_id(v.get("title")))
+        .or_else(|| run_browse_id(v.get("subtitle")))
+        .or_else(|| {
+            flex.and_then(|columns| columns.first())
+                .and_then(|column| {
+                    find_key(
+                        &column["musicResponsiveListItemFlexColumnRenderer"]["text"],
+                        "browseEndpoint",
+                    )
+                })
+                .and_then(|endpoint| endpoint["browseId"].as_str())
+        });
     let video_id = watch
         .and_then(|w| w["videoId"].as_str())
         .or_else(|| v["videoId"].as_str());
@@ -421,30 +468,116 @@ fn parse_renderer(v: &Value) -> Option<Item> {
         set_video_id,
     })
 }
+fn run_browse_id(value: Option<&Value>) -> Option<&str> {
+    value?
+        .get("runs")?
+        .as_array()?
+        .iter()
+        .find_map(|run| run.pointer("/navigationEndpoint/browseEndpoint/browseId"))
+        .and_then(Value::as_str)
+}
+fn parse_lockup(v: &Value) -> Option<Item> {
+    let title = v
+        .pointer("/metadata/lockupMetadataViewModel/title/content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if title.is_empty() {
+        return None;
+    }
+    let content_type = v.get("contentType").and_then(Value::as_str).unwrap_or("");
+    let content_id = v.get("contentId").and_then(Value::as_str);
+    let video_id = v
+        .pointer("/rendererContext/commandContext/onTap/innertubeCommand/watchEndpoint/videoId")
+        .and_then(Value::as_str)
+        .or_else(|| content_id.filter(|_| content_type.contains("VIDEO")));
+    let browse_id = v
+        .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+        .and_then(Value::as_str)
+        .or_else(|| content_id.filter(|_| !content_type.contains("VIDEO")));
+    let (id, kind) = if let Some(video_id) = video_id.filter(|id| valid_video_id(id)) {
+        (video_id, ItemKind::Track)
+    } else if let Some(browse_id) = browse_id.filter(|id| !id.is_empty()) {
+        let kind = if browse_id.starts_with("MPRE") {
+            ItemKind::Album
+        } else if browse_id.starts_with("UC") {
+            ItemKind::Artist
+        } else {
+            ItemKind::Playlist
+        };
+        (browse_id, kind)
+    } else {
+        return None;
+    };
+    let thumbnail = v
+        .pointer("/contentImage/thumbnailViewModel/image/sources")
+        .and_then(Value::as_array)
+        .and_then(|sources| {
+            sources
+                .iter()
+                .rfind(|source| source["width"].as_u64().unwrap_or(120) <= 360)
+                .or_else(|| sources.first())
+        })
+        .and_then(|source| source["url"].as_str())
+        .map(str::to_owned);
+    Some(Item {
+        id: id.into(),
+        title,
+        subtitle: String::new(),
+        kind,
+        thumbnail,
+        duration: None,
+        set_video_id: None,
+    })
+}
+fn lockup_has_content(v: &Value) -> bool {
+    v.get("contentId").and_then(Value::as_str).is_some()
+        || v.get("contentType").and_then(Value::as_str).is_some()
+}
+fn is_create_affordance(v: &Value) -> bool {
+    v.pointer("/navigationEndpoint/createPlaylistEndpoint")
+        .is_some()
+}
 struct Collected {
     items: Vec<Item>,
-    saw_item_renderer: bool,
+    saw_unparsed: bool,
 }
 fn is_item_renderer(key: &str) -> bool {
     key.ends_with("ItemRenderer")
         || key == "playlistPanelVideoRenderer"
         || key == "compactStationRenderer"
 }
+fn is_catalog_leaf(key: &str) -> bool {
+    is_item_renderer(key) || key == "lockupViewModel"
+}
+fn note_leaf(key: &str, child: &Value, collected: &mut Collected) {
+    if key == "lockupViewModel" {
+        if let Some(item) = parse_lockup(child) {
+            collected.items.push(item);
+        } else if lockup_has_content(child) {
+            collected.saw_unparsed = true;
+        }
+        return;
+    }
+    if let Some(item) = parse_renderer(child) {
+        collected.items.push(item);
+    } else if !is_create_affordance(child) {
+        collected.saw_unparsed = true;
+    }
+}
 fn collect(v: &Value, collected: &mut Collected) {
     match v {
         Value::Object(object) => {
             let mut matched = false;
             for (key, child) in object {
-                if is_item_renderer(key) {
+                if is_catalog_leaf(key) {
                     matched = true;
-                    collected.saw_item_renderer = true;
-                    if let Some(item) = parse_renderer(child) {
-                        collected.items.push(item);
-                    }
+                    note_leaf(key, child, collected);
                 }
             }
             for (key, child) in object {
-                if !matched || !is_item_renderer(key) {
+                if !matched || !is_catalog_leaf(key) {
                     collect(child, collected);
                 }
             }
@@ -457,10 +590,41 @@ fn collect(v: &Value, collected: &mut Collected) {
         _ => {}
     }
 }
+fn continuation_token(v: &Value) -> Option<String> {
+    find_key(v, "continuationItemRenderer")
+        .and_then(|item| {
+            item.pointer("/continuationEndpoint/continuationCommand/token")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.pointer("/continuationEndpoint/commandExecutorCommand/commands")
+                        .and_then(Value::as_array)
+                        .and_then(|commands| {
+                            commands.iter().find_map(|command| {
+                                let request = command
+                                    .pointer("/continuationCommand/request")
+                                    .and_then(Value::as_str)?;
+                                if request != "CONTINUATION_REQUEST_TYPE_BROWSE" {
+                                    return None;
+                                }
+                                command
+                                    .pointer("/continuationCommand/token")
+                                    .and_then(Value::as_str)
+                            })
+                        })
+                })
+        })
+        .or_else(|| {
+            find_key(v, "nextContinuationData").and_then(|data| data["continuation"].as_str())
+        })
+        .or_else(|| {
+            find_key(v, "reloadContinuationData").and_then(|data| data["continuation"].as_str())
+        })
+        .map(str::to_owned)
+}
 fn parse_detailed(v: &Value) -> (Page, bool) {
     let mut collected = Collected {
         items: Vec::new(),
-        saw_item_renderer: false,
+        saw_unparsed: false,
     };
     collect(v, &mut collected);
     let mut seen = HashSet::new();
@@ -468,18 +632,12 @@ fn parse_detailed(v: &Value) -> (Page, bool) {
         .items
         .retain(|item| seen.insert((item.id.clone(), item.set_video_id.clone())));
     collected.items.truncate(100);
-    let unrecognized = collected.saw_item_renderer && collected.items.is_empty();
-    let continuation = find_key(v, "nextContinuationData")
-        .or_else(|| find_key(v, "reloadContinuationData"))
-        .and_then(|data| data["continuation"].as_str())
-        .or_else(|| find_key(v, "continuationCommand").and_then(|data| data["token"].as_str()))
-        .map(str::to_owned);
     (
         Page {
             items: collected.items,
-            continuation,
+            continuation: continuation_token(v),
         },
-        unrecognized,
+        collected.saw_unparsed,
     )
 }
 pub fn parse_page(v: &Value) -> Page {
@@ -487,17 +645,102 @@ pub fn parse_page(v: &Value) -> Page {
 }
 fn known_catalog_container(v: &Value) -> bool {
     find_key(v, "musicShelfRenderer").is_some()
+        || find_key(v, "gridRenderer").is_some()
         || find_key(v, "musicGridRenderer").is_some()
         || find_key(v, "musicCarouselShelfRenderer").is_some()
         || find_key(v, "musicImmersiveCarouselShelfRenderer").is_some()
+        || find_key(v, "musicPlaylistShelfRenderer").is_some()
         || find_key(v, "sectionListRenderer").is_some()
         || find_key(v, "messageRenderer").is_some()
         || find_key(v, "continuationContents").is_some()
+        || find_key(v, "appendContinuationItemsAction").is_some()
+}
+fn is_structural_renderer(key: &str) -> bool {
+    matches!(
+        key,
+        "singleColumnBrowseResultsRenderer"
+            | "twoColumnBrowseResultsRenderer"
+            | "tabRenderer"
+            | "sectionListRenderer"
+            | "itemSectionRenderer"
+            | "gridRenderer"
+            | "musicGridRenderer"
+            | "musicShelfRenderer"
+            | "musicPlaylistShelfRenderer"
+            | "musicCarouselShelfRenderer"
+            | "musicImmersiveCarouselShelfRenderer"
+            | "musicCarouselShelfBasicHeaderRenderer"
+            | "musicTastebuilderShelfRenderer"
+            | "messageRenderer"
+            | "messageSubtextRenderer"
+            | "buttonRenderer"
+            | "menuRenderer"
+            | "menuNavigationItemRenderer"
+            | "menuServiceItemRenderer"
+            | "toggleMenuServiceItemRenderer"
+            | "modalWithTitleAndButtonRenderer"
+            | "notificationTextRenderer"
+            | "notificationActionRenderer"
+            | "musicThumbnailRenderer"
+            | "thumbnailRenderer"
+            | "musicPlayButtonRenderer"
+            | "musicItemThumbnailOverlayRenderer"
+            | "musicResponsiveListItemFlexColumnRenderer"
+            | "musicResponsiveListItemFixedColumnRenderer"
+            | "likeButtonRenderer"
+            | "menuServiceItemDownloadRenderer"
+            | "checkboxRenderer"
+            | "musicInlineBadgeRenderer"
+            | "chipCloudChipRenderer"
+            | "continuationItemRenderer"
+            | "musicDetailHeaderRenderer"
+            | "musicEditablePlaylistDetailHeaderRenderer"
+            | "musicResponsiveHeaderRenderer"
+            | "musicShelfContinuation"
+            | "gridContinuation"
+            | "musicPlaylistShelfContinuation"
+    ) || is_catalog_leaf(key)
+}
+fn foreign_content(v: &Value) -> bool {
+    match v {
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            ((key.ends_with("Renderer") || key.ends_with("ViewModel"))
+                && !is_structural_renderer(key))
+                || foreign_content(child)
+        }),
+        Value::Array(array) => array.iter().any(foreign_content),
+        _ => false,
+    }
+}
+fn parse_innertube_context(page: &str) -> Result<Value> {
+    let mut rest = page;
+    while let Some(offset) = rest.find("ytcfg.set(") {
+        rest = &rest[offset + "ytcfg.set(".len()..];
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        if let Some(Ok(config)) = stream.next() {
+            if let Some(context) = config.get("INNERTUBE_CONTEXT") {
+                return Ok(context.clone());
+            }
+            if let Some(version) = config
+                .get("INNERTUBE_CLIENT_VERSION")
+                .and_then(Value::as_str)
+            {
+                return Ok(json!({
+                    "client": {"clientName": "WEB_REMIX", "clientVersion": version, "hl": "ru"},
+                    "user": {}
+                }));
+            }
+        }
+    }
+    bail!("YouTube Music изменил настройки клиента. Требуется обновление RustMusic.")
 }
 fn parse_checked(v: &Value) -> Result<Page> {
     let (page, unrecognized) = parse_detailed(v);
-    if unrecognized {
+    if page.items.is_empty() && (unrecognized || foreign_content(v)) {
         bail!("YouTube Music вернул раздел в неизвестном формате. Попробуйте обновить клиент.");
+    }
+    if page.items.is_empty() && find_key(v, "signInEndpoint").is_some() {
+        bail!("YouTube Music не отдал этот раздел для текущей сессии. Подключите аккаунт заново.");
     }
     if page.items.is_empty() && !known_catalog_container(v) {
         bail!("YouTube Music вернул неподдерживаемый ответ. Попробуйте обновить клиент.");
@@ -652,5 +895,164 @@ mod tests {
         assert!(library_requires_session("LM"));
         assert!(library_requires_session("FEmusic_liked_playlists"));
         assert!(!library_requires_session("FEmusic_home"));
+    }
+    #[test]
+    fn library_and_liked_fixtures_keep_identity_and_continuation() {
+        let library: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/library_playlists.json"
+        ))
+        .unwrap();
+        let page = parse_checked(&library).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].kind, ItemKind::Playlist);
+        assert_eq!(page.items[0].id, "VLPLFIXTURE0001");
+        assert_eq!(page.items[0].title, "Fixture playlist");
+        assert_eq!(page.items[0].subtitle, "5 songs");
+        assert_eq!(page.continuation.as_deref(), Some("continuation-fixture"));
+        let liked: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/liked_tracks.json"))
+                .unwrap();
+        let page = parse_checked(&liked).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].kind, ItemKind::Track);
+        assert_eq!(page.items[0].id, "abcdefghijk");
+        assert_eq!(page.items[0].set_video_id.as_deref(), Some("set-fixture-1"));
+        assert_eq!(
+            page.continuation.as_deref(),
+            Some("liked-continuation-fixture")
+        );
+        let next = parse_checked(&json!({
+            "onResponseReceivedActions": [{
+                "appendContinuationItemsAction": {
+                    "continuationItems": [{
+                        "musicResponsiveListItemRenderer": {
+                            "flexColumns": [{
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                    "text": {"runs": [{"text": "Fixture page 2"}]}
+                                }
+                            }],
+                            "playlistItemData": {"videoId": "bbcdefghijk"}
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(next.items[0].id, "bbcdefghijk");
+        let lockup = parse_checked(&json!({
+            "lockupViewModel": {
+                "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                "contentId": "PLFIXTURE0001",
+                "metadata": {"lockupMetadataViewModel": {"title": {"content": "Fixture lockup"}}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(lockup.items[0].kind, ItemKind::Playlist);
+        assert_eq!(lockup.items[0].id, "PLFIXTURE0001");
+        assert_eq!(lockup.items[0].title, "Fixture lockup");
+    }
+    #[test]
+    fn signed_out_shell_and_unknown_shelf_are_not_an_empty_library() {
+        let signed_out: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/library_signin.json"))
+                .unwrap();
+        let error = parse_checked(&signed_out).unwrap_err().to_string();
+        assert!(error.contains("сессии"));
+        assert!(!error.contains("Looking"));
+        assert!(!error.contains("Sign in"));
+        let error = parse_checked(&json!({
+            "contents": {"sectionListRenderer": {"contents": [
+                {"musicFutureShelfRenderer": {"title": "hidden"}}
+            ]}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("неизвестном формате"));
+        assert!(!error.contains("hidden"));
+        let empty = parse_checked(&json!({
+            "contents": {"sectionListRenderer": {"contents": [{
+                "gridRenderer": {"items": [{
+                    "musicTwoRowItemRenderer": {
+                        "title": {"runs": [{"text": "New playlist"}]},
+                        "navigationEndpoint": {"createPlaylistEndpoint": {"hack": true}}
+                    }
+                }]}
+            }]}}
+        }))
+        .unwrap();
+        assert!(empty.items.is_empty());
+    }
+    #[tokio::test]
+    async fn authenticated_browse_sends_the_session_and_parses_library() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let library = include_str!("../../../tests/fixtures/library_playlists.json");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                loop {
+                    let mut tmp = [0u8; 2048];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        stream.read(&mut tmp),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+                        Ok(Err(_)) => break,
+                    }
+                    if buf.len() > 32_000 {
+                        break;
+                    }
+                }
+                let raw = String::from_utf8_lossy(&buf);
+                record.lock().await.push(raw.to_string());
+                let body = if raw.starts_with("GET ") {
+                    r#"ytcfg.set({"INNERTUBE_CONTEXT":{"client":{"clientName":"WEB_REMIX","clientVersion":"fixture","visitorData":"visitor-fixture"}}});"#
+                } else {
+                    library
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut client = MusicClient::new(Some(Session {
+            cookie: "SID=fixture; __Secure-3PAPISID=fixture".into(),
+            auth_user: "0".into(),
+            netscape: String::new(),
+        }))
+        .unwrap();
+        let origin = format!("http://{address}");
+        client.page_base = Some(origin.clone());
+        client.test_base = Some(format!("{origin}/youtubei/v1"));
+        let page = client
+            .browse("FEmusic_liked_playlists", None)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "VLPLFIXTURE0001");
+        assert_eq!(page.continuation.as_deref(), Some("continuation-fixture"));
+        let captured = seen.lock().await;
+        assert!(captured.len() >= 2);
+        let home = &captured[0];
+        assert!(home.starts_with("GET "));
+        assert!(home.to_ascii_lowercase().contains("cookie:"));
+        assert!(home.contains("__Secure-3PAPISID=fixture"));
+        assert!(home.to_ascii_lowercase().contains("x-goog-authuser: 0"));
+        let browse = &captured[1];
+        assert!(browse.starts_with("POST "));
+        assert!(browse.contains("visitor-fixture"));
+        assert!(browse.contains("FEmusic_liked_playlists"));
+        assert!(browse.contains("__Secure-3PAPISID=fixture"));
     }
 }
