@@ -176,6 +176,14 @@ impl MusicClient {
                     }
                     Ok(json!({"ok":true}))
                 }
+                Mutation::Dislike { video_id } => {
+                    check_video(&video_id)?;
+                    client
+                        .rate_song(&video_id, ytmusicapi::LikeStatus::Dislike)
+                        .await
+                        .map_err(provider_error)?;
+                    Ok(json!({"ok":true}))
+                }
                 Mutation::Create { title } => {
                     check_title(&title)?;
                     let result = client
@@ -230,8 +238,15 @@ impl MusicClient {
                 } => {
                     check_playlist(&playlist_id)?;
                     check_set_id(&set_video_id)?;
-                    check_set_id(&before_set_video_id)?;
-                    self.edit(&playlist_id,json!([{"action":"ACTION_MOVE_VIDEO_BEFORE","setVideoId":set_video_id,"movedSetVideoIdSuccessor":before_set_video_id}])).await
+                    let mut action = json!({
+                        "action": "ACTION_MOVE_VIDEO_BEFORE",
+                        "setVideoId": set_video_id
+                    });
+                    if !before_set_video_id.is_empty() {
+                        check_set_id(&before_set_video_id)?;
+                        action["movedSetVideoIdSuccessor"] = json!(before_set_video_id);
+                    }
+                    self.edit(&playlist_id, json!([action])).await
                 }
             }
         };

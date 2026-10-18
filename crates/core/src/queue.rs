@@ -69,6 +69,71 @@ impl Queue {
     pub fn append(&mut self, item: Item) {
         self.items.push(item);
     }
+    /// Place `from` at index `to`. The track that is current stays current.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if !reorder_vec(&mut self.items, from, to) {
+            return;
+        }
+        self.index = self.index.map(|index| shifted_index(index, from, to));
+    }
+    /// Insert a track to play after the current one. An empty queue just gains the track.
+    pub fn insert_next(&mut self, item: Item) -> bool {
+        if self.items.len() >= 500 {
+            return false;
+        }
+        let at = self
+            .index
+            .map(|index| index.saturating_add(1))
+            .unwrap_or(self.items.len())
+            .min(self.items.len());
+        self.items.insert(at, item);
+        true
+    }
+}
+pub fn reorder_vec<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+fn shifted_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+/// Where a playlist row should move on YouTube Music.
+/// `before_set_video_id` is the row that must end up immediately after the
+/// moved track. `None` means the track moves to the end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistReorder {
+    pub set_video_id: String,
+    pub before_set_video_id: Option<String>,
+}
+pub fn playlist_reorder(items: &[Item], from: usize, to: usize) -> Option<PlaylistReorder> {
+    if from == to || from >= items.len() || to >= items.len() {
+        return None;
+    }
+    let set_video_id = items[from].set_video_id.clone()?;
+    let mut order: Vec<Option<String>> =
+        items.iter().map(|item| item.set_video_id.clone()).collect();
+    let moved = order.remove(from);
+    order.insert(to, moved);
+    let before = order
+        .get(to + 1)
+        .and_then(|id| id.clone())
+        .filter(|id| !id.is_empty());
+    Some(PlaylistReorder {
+        set_video_id,
+        before_set_video_id: before,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -125,5 +190,86 @@ mod tests {
         q.shuffle();
         assert!(q.previous().is_none());
         assert!(q.advance(true).is_none());
+    }
+    #[test]
+    fn reorder_keeps_the_current_track() {
+        let mut q = Queue::default();
+        q.replace(items(), 0);
+        q.reorder(0, 2);
+        assert_eq!(
+            q.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "0"]
+        );
+        assert_eq!(q.current().unwrap().id, "0");
+        q.reorder(2, 0);
+        assert_eq!(
+            q.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        assert_eq!(q.index, Some(0));
+        q.index = Some(1);
+        q.reorder(2, 0);
+        assert_eq!(
+            q.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "0", "1"]
+        );
+        assert_eq!(q.index, Some(2));
+        assert_eq!(q.current().unwrap().id, "1");
+        q.reorder(0, 0);
+        assert_eq!(q.items.len(), 3);
+    }
+    #[test]
+    fn insert_next_follows_the_current_track() {
+        let mut q = Queue::default();
+        q.replace(items(), 1);
+        assert!(q.insert_next(Item {
+            id: "next".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            q.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1", "next", "2"]
+        );
+        assert_eq!(q.current().unwrap().id, "1");
+        let mut empty = Queue::default();
+        assert!(empty.insert_next(Item {
+            id: "only".into(),
+            ..Default::default()
+        }));
+        assert_eq!(empty.items[0].id, "only");
+        assert!(empty.index.is_none());
+    }
+    #[test]
+    fn playlist_reorder_names_the_following_row() {
+        let rows: Vec<Item> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|id| Item {
+                id: id.into(),
+                set_video_id: Some(id.into()),
+                ..Default::default()
+            })
+            .collect();
+        let middle = playlist_reorder(&rows, 0, 2).unwrap();
+        assert_eq!(middle.set_video_id, "a");
+        assert_eq!(middle.before_set_video_id.as_deref(), Some("d"));
+        let end = playlist_reorder(&rows, 1, 3).unwrap();
+        assert_eq!(end.set_video_id, "b");
+        assert!(end.before_set_video_id.is_none());
+        assert!(playlist_reorder(&rows, 1, 1).is_none());
+        let mut unpositioned = rows.clone();
+        unpositioned[0].set_video_id = None;
+        assert!(playlist_reorder(&unpositioned, 0, 2).is_none());
     }
 }

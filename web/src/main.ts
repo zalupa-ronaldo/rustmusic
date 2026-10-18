@@ -38,7 +38,7 @@ const icons: Record<string, string> = {
   more: "•••",
 };
 const app = document.querySelector<HTMLDivElement>("#app")!;
-app.innerHTML = `<aside><a class="brand" href="/">${icons.music}<span>RustMusic<small>YOUR MUSIC, LESS MEMORY</small></span></a><nav><button data-nav="FEmusic_home">${icons.home} Для вас</button><button data-nav="FEmusic_liked_playlists">${icons.library} Библиотека</button><button data-nav="VLLM">${icons.heart} Любимые треки</button><button data-nav="FEmusic_liked_albums">▣ Мои альбомы</button><button data-nav="FEmusic_library_corpus_track_artists">♬ Исполнители</button></nav><div class="queue-label">ОЧЕРЕДЬ <span id="queue-count">0</span></div><div id="queue"></div><div class="aside-bottom"><span id="account-name">Аккаунт не подключён</span><button id="settings-button">${icons.settings} Настройки</button></div></aside><main><header><form id="search"><span>${icons.search}</span><input id="query" placeholder="Трек, альбом или исполнитель" autocomplete="off"><button>Найти</button></form><span class="badge">RUST · WEB CLIENT</span></header><section class="heading"><div><p>YOUTUBE MUSIC</p><h1 id="page-title">Для вас</h1><span id="page-subtitle">Всё, что хочется слушать</span></div><div id="playlist-tools"></div></section><div id="notice" role="status"></div><section id="items"></section><button id="more" hidden>Загрузить ещё</button></main><footer><div class="now-playing"><div id="now-cover">♪</div><div><strong id="now-title">Выберите музыку</strong><span id="now-artist">Ваша библиотека. Ваш ритм.</span></div></div><div class="transport"><div class="transport-buttons"><button id="shuffle" title="Перемешать">${icons.shuffle}</button><button id="previous" title="Предыдущий">${icons.previous}</button><button id="play" class="play" title="Воспроизведение / пауза">${icons.play}</button><button id="next" title="Следующий">${icons.next}</button><button id="repeat" title="Повтор выключен">${icons.repeat}</button></div><div class="timeline"><time id="position">0:00</time><input id="seek" type="range" min="0" max="1" value="0" step="0.1" aria-label="Позиция трека"><time id="duration">0:00</time></div></div><div class="volume"><span>♫</span><input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Громкость"></div></footer><dialog id="settings"><button class="dialog-close" data-close="settings">×</button><h2>Подключить YouTube Music</h2><p>Войдите в Google в своём браузере и импортируйте сессию. Контейнер не читает браузерные профили компьютера.</p><a href="https://music.youtube.com" target="_blank" rel="noopener noreferrer">Открыть YouTube Music ↗</a><form id="import"><label>Сессия: JSON headers, Cookie или Netscape cookies.txt<textarea id="session-input" rows="5" spellcheck="false" autocomplete="off" required></textarea></label><label class="file">Выбрать файл<input id="session-file" type="file" accept=".json,.txt"></label><label>Номер аккаунта Google<input id="auth-user" type="number" min="0" max="255" value="0"></label><p class="muted">Сессия хранится зашифрованной в volume. Не передавайте её другим людям.</p><button class="primary">Проверить и сохранить</button></form><div class="settings-actions"><button id="disconnect">Удалить сессию Google</button><button id="web-logout">Выйти из сервера</button></div></dialog><dialog id="login"><h2>Ваш сервер RustMusic</h2><p>Введите ключ из <code>.secrets/server-key</code>, созданный скриптом настройки Docker.</p><form id="login-form"><input id="password" type="password" autocomplete="current-password" placeholder="Ключ сервера" required><button class="primary">Войти</button><p id="login-error" role="alert"></p></form></dialog><audio id="audio" preload="none"></audio>`;
+app.innerHTML = `<aside><a class="brand" href="/">${icons.music}<span>RustMusic<small>YOUR MUSIC, LESS MEMORY</small></span></a><nav><button data-nav="FEmusic_home">${icons.home} Для вас</button><button data-nav="FEmusic_liked_playlists">${icons.library} Библиотека</button><button data-nav="VLLM">${icons.heart} Любимые треки</button><button data-nav="FEmusic_liked_albums">▣ Мои альбомы</button><button data-nav="FEmusic_library_corpus_track_artists">♬ Исполнители</button></nav><div class="queue-label">ОЧЕРЕДЬ <span id="queue-count">0</span></div><div id="queue"></div><div class="aside-bottom"><span id="account-name">Аккаунт не подключён</span><small id="build-label" class="build-label"></small><button id="settings-button">${icons.settings} Настройки</button></div></aside><main><header><form id="search"><span>${icons.search}</span><input id="query" placeholder="Трек, альбом или исполнитель" autocomplete="off"><button>Найти</button></form><span class="badge">RUST · WEB CLIENT</span></header><section class="heading"><div><p>YOUTUBE MUSIC</p><h1 id="page-title">Для вас</h1><span id="page-subtitle">Всё, что хочется слушать</span></div><div id="playlist-tools"></div></section><div id="notice" role="status"></div><section id="items"></section><button id="more" hidden>Загрузить ещё</button></main><footer><div class="now-playing"><div id="now-cover">♪</div><div><strong id="now-title">Выберите музыку</strong><span id="now-artist">Ваша библиотека. Ваш ритм.</span><div class="now-actions"><button id="like-current" title="Лайк · в библиотеку">♥</button><button id="dislike-current" title="Дизлайк">👎</button><button id="download-current" class="download" title="Скачать">↓</button></div></div></div><div class="transport"><div class="transport-buttons"><button id="shuffle" title="Перемешать">${icons.shuffle}</button><button id="previous" title="Предыдущий">${icons.previous}</button><button id="play" class="play" title="Воспроизведение / пауза">${icons.play}</button><button id="next" title="Следующий">${icons.next}</button><button id="repeat" title="Повтор выключен">${icons.repeat}</button></div><div class="timeline"><time id="position">0:00</time><input id="seek" type="range" min="0" max="1" value="0" step="0.1" aria-label="Позиция трека"><time id="duration">0:00</time></div></div><div class="volume"><span>♫</span><input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Громкость"></div></footer><dialog id="settings"><button class="dialog-close" data-close="settings">×</button><h2>Подключить YouTube Music</h2><p>Войдите в Google в своём браузере и импортируйте сессию. Контейнер не читает браузерные профили компьютера.</p><a href="https://music.youtube.com" target="_blank" rel="noopener noreferrer">Открыть YouTube Music ↗</a><form id="import"><label>Сессия: JSON headers, Cookie или Netscape cookies.txt<textarea id="session-input" rows="5" spellcheck="false" autocomplete="off" required></textarea></label><label class="file">Выбрать файл<input id="session-file" type="file" accept=".json,.txt"></label><label>Номер аккаунта Google<input id="auth-user" type="number" min="0" max="255" value="0"></label><p class="muted">Сессия хранится зашифрованной в volume. Не передавайте её другим людям.</p><button class="primary">Проверить и сохранить</button></form><div class="settings-actions"><button id="disconnect">Удалить сессию Google</button><button id="web-logout">Выйти из сервера</button></div></dialog><dialog id="login"><h2>Ваш сервер RustMusic</h2><p>Введите ключ из <code>.secrets/server-key</code>, созданный скриптом настройки Docker.</p><form id="login-form"><input id="password" type="password" autocomplete="current-password" placeholder="Ключ сервера" required><button class="primary">Войти</button><p id="login-error" role="alert"></p></form></dialog><audio id="audio" preload="none"></audio>`;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 const audio = $<HTMLAudioElement>("audio");
@@ -88,10 +88,132 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 const run = (fn: () => Promise<unknown>) => {
   void fn().catch((e) => notice(e.message, true));
 };
+type DownloadState = {
+  id: string;
+  state: "idle" | "active" | "ready" | "failed";
+  progress: number;
+};
+const downloads = new Map<string, DownloadState>();
+let downloadTimer = 0;
 function cover(item: Item) {
   return item.thumbnail
-    ? `<img src="${escape(item.thumbnail)}" loading="lazy" alt="" referrerpolicy="no-referrer">`
+    ? `<img src="/api/v1/art?url=${encodeURIComponent(item.thumbnail)}" loading="lazy" alt="">`
     : `<span class="cover-placeholder">♪</span>`;
+}
+function editablePlaylist() {
+  return (
+    route.type === "browse" &&
+    (route.value.startsWith("PL") || route.value.startsWith("VLPL"))
+  );
+}
+function downloadButton(item: Item, index: number) {
+  const state = downloads.get(item.id);
+  const phase = state?.state ?? "idle";
+  const label =
+    phase === "ready"
+      ? "✓"
+      : phase === "active"
+        ? `${state?.progress ?? 0}%`
+        : phase === "failed"
+          ? "!"
+          : "↓";
+  const title =
+    phase === "ready"
+      ? "Скачано"
+      : phase === "active"
+        ? "Скачивание"
+        : phase === "failed"
+          ? "Повторить скачивание"
+          : "Скачать";
+  return `<button class="download ${phase}" data-download="${index}" style="--p:${state?.progress ?? 0}" aria-label="${title}" title="${title}">${label}</button>`;
+}
+function trackRow(item: Item, index: number, n: number) {
+  const editable = editablePlaylist() && !!item.set_video_id;
+  const handle = editable
+    ? `<span class="drag-handle" draggable="true" data-drag-list="playlist" data-drag-from="${index}" title="Перетащите, чтобы изменить порядок">⋮⋮</span>`
+    : "";
+  const drop = editable
+    ? ` data-drop-list="playlist" data-drop-index="${index}"`
+    : "";
+  const library = authenticated
+    ? `<button data-enqueue="${index}">В очередь</button><button data-next="${index}">Следующим</button><button data-radio="${index}">Радио трека</button><button data-like="${index}">Лайк · в библиотеку</button><button data-dislike="${index}">Дизлайк</button><button data-unlike="${index}">Снять оценку</button><button data-add="${index}">Добавить в плейлист</button>${item.set_video_id && route.type === "browse" ? `<button data-remove="${index}">Убрать из плейлиста</button>` : ""}`
+    : `<button data-enqueue="${index}">В очередь</button><button data-next="${index}">Следующим</button><button data-radio="${index}">Радио трека</button>`;
+  return `<div class="track"${drop}>${handle}<span class="track-number">${n + 1}</span><button class="track-open" data-open="${index}">${cover(item)}<span><strong>${escape(item.title)}</strong><small>${escape(item.subtitle)}</small></span></button><span class="track-duration">${escape(item.duration ?? "—")}</span>${downloadButton(item, index)}<details><summary aria-label="Действия с треком">•••</summary><div class="track-menu">${library}</div></details></div>`;
+}
+function playlistReorder(list: Item[], from: number, to: number) {
+  if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length)
+    return null;
+  const setVideoId = list[from]?.set_video_id;
+  if (!setVideoId) return null;
+  const order = list.map((item) => item.set_video_id);
+  const [moved] = order.splice(from, 1);
+  order.splice(to, 0, moved);
+  return { setVideoId, before: order[to + 1] || "" };
+}
+function currentTrack() {
+  return queue.index !== null ? queue.items[queue.index] : undefined;
+}
+function syncPlayer() {
+  const item = currentTrack();
+  const button = $<HTMLButtonElement>("download-current");
+  if (!item) {
+    button.textContent = "↓";
+    button.className = "download";
+    button.disabled = true;
+    button.title = "Скачать";
+    return;
+  }
+  const state = downloads.get(item.id);
+  const phase = state?.state ?? "idle";
+  button.disabled = false;
+  button.className = `download ${phase}`;
+  button.style.setProperty("--p", String(state?.progress ?? 0));
+  button.textContent =
+    phase === "ready"
+      ? "✓"
+      : phase === "active"
+        ? `${state?.progress ?? 0}%`
+        : phase === "failed"
+          ? "!"
+          : "↓";
+  button.title =
+    phase === "ready"
+      ? "Скачано"
+      : phase === "active"
+        ? "Скачивание"
+        : phase === "failed"
+          ? "Повторить скачивание"
+          : "Скачать";
+}
+async function refreshDownloads() {
+  const value = await api<{ items: DownloadState[] }>("/downloads");
+  downloads.clear();
+  let active = false;
+  for (const item of value.items) {
+    downloads.set(item.id, item);
+    if (item.state === "active") active = true;
+  }
+  render();
+  if ($("queue-count")) renderQueue();
+  if (active && !downloadTimer) {
+    downloadTimer = window.setInterval(() => run(refreshDownloads), 700);
+  }
+  if (!active && downloadTimer) {
+    window.clearInterval(downloadTimer);
+    downloadTimer = 0;
+  }
+}
+async function downloadTrack(id: string) {
+  const current = downloads.get(id);
+  if (current?.state === "ready") {
+    notice("Трек уже скачан");
+    return;
+  }
+  downloads.set(id, { id, state: "active", progress: current?.progress ?? 0 });
+  render();
+  syncPlayer();
+  await api(`/download/${encodeURIComponent(id)}`, { method: "POST" });
+  await refreshDownloads();
 }
 function render() {
   $("page-title").textContent = route.title;
@@ -110,7 +232,7 @@ function render() {
     .map((item, index) => ({ item, index }))
     .filter(({ item }) => item.kind === "track");
   $("items").innerHTML =
-    `${collections.length ? `<div class="cards">${collections.map(({ item, index }) => `<button class="card" data-open="${index}"><div class="card-cover">${cover(item)}<span class="card-play">▶</span></div><strong>${escape(item.title)}</strong><small>${escape(item.subtitle || { album: "Альбом", artist: "Исполнитель", playlist: "Плейлист" }[item.kind as "album" | "artist" | "playlist"])}</small></button>`).join("")}</div>` : ""}${tracks.length ? `<div class="track-list"><div class="track-header"><span>ТРЕК</span><span>ДЛИТЕЛЬНОСТЬ</span></div>${tracks.map(({ item, index }, n) => `<div class="track"><span class="track-number">${n + 1}</span><button class="track-open" data-open="${index}">${cover(item)}<span><strong>${escape(item.title)}</strong><small>${escape(item.subtitle)}</small></span></button><span class="track-duration">${escape(item.duration ?? "—")}</span><details><summary aria-label="Действия с треком">•••</summary><div class="track-menu"><button data-enqueue="${index}">В очередь</button><button data-radio="${index}">Радио трека</button>${authenticated ? `<button data-like="${index}">Поставить лайк</button><button data-unlike="${index}">Снять лайк</button><button data-add="${index}">Добавить в плейлист</button>${item.set_video_id && route.type === "browse" ? `<button data-remove="${index}">Убрать из плейлиста</button>${n > 0 ? `<button data-move="${index}">Поднять выше</button>` : ""}` : ""}` : ""}</div></details></div>`).join("")}</div>` : ""}${!items.length ? '<div class="empty"><span>♫</span><h2>Музыка начинается здесь</h2><p>Попробуйте поиск или подключите свою библиотеку.</p></div>' : ""}`;
+    `${collections.length ? `<div class="cards">${collections.map(({ item, index }) => `<button class="card" data-open="${index}"><div class="card-cover">${cover(item)}<span class="card-play">▶</span></div><strong>${escape(item.title)}</strong><small>${escape(item.subtitle || { album: "Альбом", artist: "Исполнитель", playlist: "Плейлист" }[item.kind as "album" | "artist" | "playlist"])}</small></button>`).join("")}</div>` : ""}${tracks.length ? `<div class="track-list"><div class="track-header"><span>ТРЕК</span><span>ДЛИТЕЛЬНОСТЬ</span></div>${tracks.map(({ item, index }, n) => trackRow(item, index, n)).join("")}</div>` : ""}${!items.length ? '<div class="empty"><span>♫</span><h2>Музыка начинается здесь</h2><p>Попробуйте поиск или подключите свою библиотеку.</p></div>' : ""}`;
   $<HTMLButtonElement>("more").hidden = !continuation;
   const editable =
     route.type === "browse" &&
@@ -159,9 +281,10 @@ function renderQueue() {
   $("queue").innerHTML = queue.items
     .map(
       (item, index) =>
-        `<button class="queue-item ${queue.index === index ? "active" : ""}" data-queue="${index}"><span>${queue.index === index ? "▶" : "♪"}</span><span><strong>${escape(item.title)}</strong><small>${escape(item.subtitle)}</small></span></button>`,
+        `<div class="queue-item ${queue.index === index ? "active" : ""}" data-drop-list="queue" data-drop-index="${index}"><span class="drag-handle" draggable="true" data-drag-list="queue" data-drag-from="${index}" title="Перетащите, чтобы изменить порядок">⋮⋮</span><button data-queue="${index}"><span>${queue.index === index ? "▶" : "♪"}</span><span><strong>${escape(item.title)}</strong><small>${escape(item.subtitle)}</small></span></button></div>`,
     )
     .join("");
+  syncPlayer();
   $("repeat").classList.toggle("active", queue.repeat !== "off");
   $("repeat").textContent = queue.repeat === "one" ? "↻₁" : "↻";
   $("repeat").title =
@@ -258,6 +381,11 @@ $("items").addEventListener("click", (event) => {
   if (data.open !== undefined) run(() => openItem(index));
   if (data.enqueue !== undefined && item)
     run(() => queueCommand({ action: "append", item }));
+  if (data.next !== undefined && item)
+    run(() => queueCommand({ action: "insert_next", item }));
+  if (data.download !== undefined && item) run(() => downloadTrack(item.id));
+  if (data.dislike !== undefined && item)
+    run(() => mutate({ action: "dislike", video_id: item.id }));
   if (data.radio !== undefined && item)
     run(() =>
       navigate({
@@ -297,21 +425,6 @@ $("items").addEventListener("click", (event) => {
         set_video_id: item.set_video_id,
       }),
     );
-  if (data.move !== undefined) {
-    const before = items
-      .slice(0, index)
-      .reverse()
-      .find((i) => i.kind === "track" && i.set_video_id);
-    if (before)
-      run(() =>
-        mutate({
-          action: "move",
-          playlist_id: route.value.replace(/^VL/, ""),
-          set_video_id: item.set_video_id,
-          before_set_video_id: before.set_video_id,
-        }),
-      );
-  }
 });
 $("playlist-tools").addEventListener("click", (event) => {
   const id = (event.target as HTMLElement).closest("button")?.id;
@@ -396,6 +509,86 @@ $("shuffle").addEventListener("click", () =>
 $("repeat").addEventListener("click", () =>
   run(() => queueCommand({ action: "repeat" })),
 );
+$("like-current").addEventListener("click", () => {
+  const item = currentTrack();
+  if (item) run(() => mutate({ action: "like", video_id: item.id, liked: true }));
+});
+$("dislike-current").addEventListener("click", () => {
+  const item = currentTrack();
+  if (item) run(() => mutate({ action: "dislike", video_id: item.id }));
+});
+$("download-current").addEventListener("click", () => {
+  const item = currentTrack();
+  if (item) run(() => downloadTrack(item.id));
+});
+let dragFrom: { list: string; index: number } | null = null;
+document.addEventListener("dragstart", (event) => {
+  const handle = (event.target as HTMLElement).closest<HTMLElement>(
+    "[data-drag-from]",
+  );
+  if (!handle?.dataset.dragList || handle.dataset.dragFrom === undefined) return;
+  dragFrom = {
+    list: handle.dataset.dragList,
+    index: Number(handle.dataset.dragFrom),
+  };
+  event.dataTransfer?.setData("text/plain", `${dragFrom.list}:${dragFrom.index}`);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+});
+document.addEventListener("dragover", (event) => {
+  const row = (event.target as HTMLElement).closest<HTMLElement>(
+    "[data-drop-index]",
+  );
+  if (!row || !dragFrom || row.dataset.dropList !== dragFrom.list) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  document
+    .querySelectorAll(".drop-target")
+    .forEach((el) => el.classList.remove("drop-target"));
+  row.classList.add("drop-target");
+});
+document.addEventListener("drop", (event) => {
+  const row = (event.target as HTMLElement).closest<HTMLElement>(
+    "[data-drop-index]",
+  );
+  document
+    .querySelectorAll(".drop-target")
+    .forEach((el) => el.classList.remove("drop-target"));
+  const from = dragFrom;
+  dragFrom = null;
+  if (!row || !from || row.dataset.dropList !== from.list) return;
+  event.preventDefault();
+  const to = Number(row.dataset.dropIndex);
+  if (!Number.isInteger(to) || from.index === to) return;
+  if (from.list === "queue") {
+    run(() => queueCommand({ action: "reorder", from: from.index, to }));
+    return;
+  }
+  const moved = playlistReorder(items, from.index, to);
+  if (!moved) return;
+  const playlistId = route.value.replace(/^VL/, "");
+  run(async () => {
+    const [item] = items.splice(from.index, 1);
+    if (item) items.splice(to, 0, item);
+    render();
+    try {
+      await mutate({
+        action: "move",
+        playlist_id: playlistId,
+        set_video_id: moved.setVideoId,
+        before_set_video_id: moved.before,
+      });
+    } catch (error) {
+      await navigate(route);
+      throw error;
+    }
+  });
+});
+document.addEventListener("dragend", () => {
+  dragFrom = null;
+  document
+    .querySelectorAll(".drop-target")
+    .forEach((el) => el.classList.remove("drop-target"));
+});
 $("volume").addEventListener("input", () => {
   audio.volume = Number($<HTMLInputElement>("volume").value);
 });
@@ -522,12 +715,20 @@ $<HTMLDialogElement>("login").addEventListener("cancel", (event) =>
   event.preventDefault(),
 );
 async function start() {
-  const status = await api<{ account: { name: string } | null }>("/status");
+  const status = await api<{
+    account: { name: string } | null;
+    version?: string;
+    commit?: string;
+  }>("/status");
   authenticated = !!status.account;
   $("account-name").textContent =
     status.account?.name ?? "Аккаунт не подключён";
+  $("build-label").textContent = [status.version, status.commit]
+    .filter(Boolean)
+    .join(" · ");
   queue = await api<Queue>("/queue");
   renderQueue();
+  await refreshDownloads();
   events?.close();
   events = new EventSource("/api/v1/events");
   events.addEventListener("progress", (event) =>

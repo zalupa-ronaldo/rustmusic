@@ -37,6 +37,10 @@ pub enum Mutation {
         video_id: String,
         liked: bool,
     },
+    /// Thumbs-down. A like is what YouTube Music uses to keep a track in the library.
+    Dislike {
+        video_id: String,
+    },
     Create {
         title: String,
     },

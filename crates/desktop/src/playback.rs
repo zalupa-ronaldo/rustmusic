@@ -1,6 +1,8 @@
 use crate::player::Player;
 use anyhow::Result;
-use rustmusic_core::{CacheConfig, Resolver, Stream, TrackCache, valid_video_id};
+use rustmusic_core::{
+    CacheConfig, DownloadStore, Resolver, Stream, TrackCache, default_downloads_dir, valid_video_id,
+};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -9,18 +11,21 @@ use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartKind {
+    Offline,
     Cached,
     Network,
     Stale,
 }
 /// Order of work for a track change. `stop` is always first, before any resolve.
 #[cfg(test)]
-fn plan(cached: bool, prefetch: bool) -> &'static [&'static str] {
-    match (cached, prefetch) {
-        (true, true) => &["stop", "load-cache", "prefetch"],
-        (true, false) => &["stop", "load-cache"],
-        (false, true) => &["stop", "resolve", "load-remote", "store", "prefetch"],
-        (false, false) => &["stop", "resolve", "load-remote", "store"],
+fn plan(source: &str, prefetch: bool) -> &'static [&'static str] {
+    match (source, prefetch) {
+        ("offline", true) => &["stop", "load-offline", "prefetch"],
+        ("offline", false) => &["stop", "load-offline"],
+        ("cached", true) => &["stop", "load-cache", "prefetch"],
+        ("cached", false) => &["stop", "load-cache"],
+        ("network", true) => &["stop", "resolve", "load-remote", "store", "prefetch"],
+        _ => &["stop", "resolve", "load-remote", "store"],
     }
 }
 #[derive(Clone)]
@@ -30,6 +35,7 @@ pub struct Playback {
 struct Inner {
     epoch: AtomicU64,
     cache: Mutex<TrackCache>,
+    downloads: DownloadStore,
     prefetch: Mutex<Option<Prefetch>>,
 }
 struct Prefetch {
@@ -64,16 +70,20 @@ impl<T> Drop for AbortJoin<T> {
 }
 impl Playback {
     pub fn open() -> Self {
-        Self::new(open_cache(CacheConfig::load()))
+        Self::new(open_cache(CacheConfig::load()), open_downloads())
     }
-    fn new(cache: TrackCache) -> Self {
+    fn new(cache: TrackCache, downloads: DownloadStore) -> Self {
         Self {
             inner: Arc::new(Inner {
                 epoch: AtomicU64::new(0),
                 cache: Mutex::new(cache),
+                downloads,
                 prefetch: Mutex::new(None),
             }),
         }
+    }
+    pub fn downloads(&self) -> DownloadStore {
+        self.inner.downloads.clone()
     }
     pub fn cache(&self) -> TrackCache {
         lock(&self.inner.cache).clone()
@@ -91,7 +101,7 @@ impl Playback {
         if self.inner.epoch.load(Ordering::SeqCst) != epoch || !valid_video_id(&id) {
             return;
         }
-        if self.cache().lookup(&id).is_some() {
+        if self.downloads().lookup(&id).is_some() || self.cache().lookup(&id).is_some() {
             return;
         }
         let mut slot = lock(&self.inner.prefetch);
@@ -139,6 +149,11 @@ pub async fn start(
     if player.epoch() != epoch {
         return Ok(StartKind::Stale);
     }
+    if let Some(path) = playback.downloads().lookup(video_id) {
+        player.load_path(path, epoch).await?;
+        prefetch_next(playback, player, resolver, next_id, epoch);
+        return Ok(StartKind::Offline);
+    }
     let cache = playback.cache();
     if let Some(path) = cache.lookup(video_id) {
         player.load_path(path, epoch).await?;
@@ -175,6 +190,16 @@ fn prefetch_next(
         playback.begin_prefetch(epoch, resolver.clone(), next);
     }
 }
+fn open_downloads() -> DownloadStore {
+    let directory = default_downloads_dir();
+    if let Ok(store) = DownloadStore::open(&directory) {
+        return store;
+    }
+    DownloadStore::open(
+        std::env::temp_dir().join(format!("rustmusic-downloads-{}", std::process::id())),
+    )
+    .expect("Не удалось создать каталог загрузок")
+}
 fn open_cache(config: CacheConfig) -> TrackCache {
     if let Ok(cache) = TrackCache::open(config.clone()) {
         return cache;
@@ -198,9 +223,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     #[test]
-    fn stop_precedes_resolve_and_cache_skips_it() {
-        let cold = plan(false, true);
-        let warm = plan(true, true);
+    fn stop_precedes_resolve_and_local_files_skip_it() {
+        let cold = plan("network", true);
+        let warm = plan("cached", true);
+        let offline = plan("offline", true);
         assert_eq!(cold[0], "stop");
         assert!(
             cold.iter().position(|step| *step == "stop").unwrap()
@@ -208,6 +234,9 @@ mod tests {
         );
         assert!(!warm.contains(&"resolve"));
         assert_eq!(warm, ["stop", "load-cache", "prefetch"]);
-        assert!(!plan(true, false).contains(&"resolve"));
+        assert!(!plan("cached", false).contains(&"resolve"));
+        assert!(!offline.contains(&"resolve"));
+        assert_eq!(offline, ["stop", "load-offline", "prefetch"]);
+        assert_eq!(plan("offline", false), ["stop", "load-offline"]);
     }
 }

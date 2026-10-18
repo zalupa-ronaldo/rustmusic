@@ -34,6 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/setup-docker.sh
-      - run: docker compose build
+      - run: |
+          export RUSTMUSIC_COMMIT="$(git rev-parse --short=12 HEAD)"
+          if [ -n "$(git status --porcelain)" ]; then export RUSTMUSIC_DIRTY=1; fi
+          docker compose build
       - run: docker compose up -d --wait
       - run: curl --fail http://localhost:8080/

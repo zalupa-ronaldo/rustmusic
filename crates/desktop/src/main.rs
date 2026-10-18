@@ -6,13 +6,14 @@ mod vault;
 use iced::{
     Color, Element, Length, Subscription, Task, Theme,
     widget::{
-        button, column, container, image, pick_list, row, rule, scrollable, slider, text,
-        text_input,
+        button, column, container, image, mouse_area, pick_list, row, rule, scrollable, slider,
+        text, text_input,
     },
 };
 use rustmusic_core::{
-    Account, CacheConfig, Item, ItemKind, MusicClient, Mutation, Page, Queue, Repeat, Resolver,
-    Session, TrackCache, clear_failed_open, default_cache_dir,
+    Account, ArtCache, CacheConfig, DownloadPhase, Item, ItemKind, MusicClient, Mutation, Page,
+    Queue, Repeat, Resolver, Session, TrackCache, app_commit, app_version, clear_failed_open,
+    default_cache_dir, default_covers_dir, playlist_reorder,
 };
 use serde_json::json;
 use std::{collections::HashMap, time::Duration};
@@ -42,6 +43,17 @@ impl Route {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragList {
+    Queue,
+    Playlist,
+}
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    list: DragList,
+    from: usize,
+    hover: usize,
+}
 #[derive(Debug, Clone)]
 enum Message {
     Boot(Result<Option<Session>, String>),
@@ -57,6 +69,13 @@ enum Message {
     Enqueue(usize),
     Radio(usize),
     TrackMenu(usize),
+    DragStart(DragList, usize),
+    DragHover(DragList, usize),
+    DragDrop,
+    PlayNext(usize),
+    Download(usize),
+    DownloadCurrent,
+    DownloadFinished(Result<(), String>),
     PlayResult(u64, Result<playback::StartKind, String>),
     Toggle,
     Next(bool),
@@ -124,6 +143,9 @@ struct App {
     selected: Option<usize>,
     delete_confirm: bool,
     connecting: bool,
+    art: ArtCache,
+    drag: Option<Drag>,
+    playlist_sync: bool,
     #[cfg(target_os = "macos")]
     media: Option<souvlaki::MediaControls>,
     #[cfg(target_os = "macos")]
@@ -192,6 +214,9 @@ impl App {
             selected: None,
             delete_confirm: false,
             connecting: false,
+            art: open_art(),
+            drag: None,
+            playlist_sync: false,
             #[cfg(target_os = "macos")]
             media,
             #[cfg(target_os = "macos")]
@@ -287,7 +312,9 @@ impl App {
         self.playing = false;
         self.position = 0.;
         self.duration = 0.;
-        self.status = if self.playback.cache().lookup(&item.id).is_some() {
+        self.status = if self.playback.downloads().lookup(&item.id).is_some() {
+            format!("Скачано: {}", item.title)
+        } else if self.playback.cache().lookup(&item.id).is_some() {
             format!("Кэш: {}", item.title)
         } else {
             format!("Получение потока: {}", item.title)
@@ -475,6 +502,7 @@ impl App {
                         } else {
                             format!("{} элементов", self.items.len())
                         };
+                        let art = self.art.clone();
                         let tasks = self
                             .items
                             .iter()
@@ -482,43 +510,18 @@ impl App {
                             .filter_map(|i| i.thumbnail.clone())
                             .filter(|url| !self.covers.contains_key(url))
                             .map(|url| {
+                                let art = art.clone();
                                 Task::perform(
                                     async move {
-                                        let data = async {
-                                            let client = reqwest::Client::builder()
-                                                .timeout(Duration::from_secs(8))
-                                                .build()
-                                                .ok()?;
-                                            let response = client.get(&url).send().await.ok()?;
-                                            if response
-                                                .content_length()
-                                                .is_some_and(|n| n > 2 * 1024 * 1024)
-                                            {
-                                                return None;
-                                            }
-                                            let bytes = response.bytes().await.ok()?;
-                                            if bytes.len() > 2 * 1024 * 1024 {
-                                                return None;
-                                            }
-                                            let mut reader = ::image::ImageReader::new(
-                                                std::io::Cursor::new(bytes),
-                                            )
-                                            .with_guessed_format()
-                                            .ok()?;
-                                            let mut limits = ::image::Limits::default();
-                                            limits.max_image_width = Some(2048);
-                                            limits.max_image_height = Some(2048);
-                                            limits.max_alloc = Some(16 * 1024 * 1024);
-                                            reader.limits(limits);
-                                            let image = reader
-                                                .decode()
-                                                .ok()?
-                                                .thumbnail(128, 128)
-                                                .to_rgba8();
-                                            Some((image.width(), image.height(), image.into_raw()))
+                                        let bytes = match art.load(&url).await {
+                                            Ok(bytes) => bytes,
+                                            Err(_) => return (url, None),
+                                        };
+                                        let image = decode_cover(&bytes);
+                                        if image.is_none() {
+                                            art.forget(&url);
                                         }
-                                        .await;
-                                        (url, data)
+                                        (url, image)
                                     },
                                     |(url, data)| Message::Cover(url, data),
                                 )
@@ -589,6 +592,53 @@ impl App {
                 };
                 Task::none()
             }
+            Message::DragStart(list, index) => {
+                self.drag = Some(Drag {
+                    list,
+                    from: index,
+                    hover: index,
+                });
+                self.status = "Перетащите трек и отпустите, чтобы изменить порядок".into();
+                Task::none()
+            }
+            Message::DragHover(list, index) => {
+                if let Some(drag) = &mut self.drag
+                    && drag.list == list
+                {
+                    drag.hover = index;
+                }
+                Task::none()
+            }
+            Message::DragDrop => self.finish_drag(),
+            Message::PlayNext(index) => {
+                if let Some(item) = self.items.get(index).cloned()
+                    && item.kind == ItemKind::Track
+                    && self.queue.insert_next(item)
+                {
+                    self.status = "Будет следующим".into();
+                }
+                Task::none()
+            }
+            Message::Download(index) => {
+                let Some(item) = self.items.get(index).cloned() else {
+                    return Task::none();
+                };
+                self.start_download(item.id)
+            }
+            Message::DownloadCurrent => {
+                let Some(id) = self.queue.current().map(|item| item.id.clone()) else {
+                    return Task::none();
+                };
+                self.start_download(id)
+            }
+            Message::DownloadFinished(Ok(())) => {
+                self.status = "Трек скачан и будет играть без сети".into();
+                Task::none()
+            }
+            Message::DownloadFinished(Err(error)) => {
+                self.status = error;
+                Task::none()
+            }
             Message::PlayResult(id, response) => {
                 if id != self.play_id {
                     return Task::none();
@@ -599,10 +649,12 @@ impl App {
                     Ok(playback::StartKind::Stale) => Task::none(),
                     Ok(kind) => {
                         self.playing = true;
-                        self.status = if kind == playback::StartKind::Cached {
-                            "Воспроизведение из кэша".into()
-                        } else {
-                            "Воспроизведение".into()
+                        self.status = match kind {
+                            playback::StartKind::Offline => "Скачанный трек".into(),
+                            playback::StartKind::Cached => "Воспроизведение из кэша".into(),
+                            playback::StartKind::Network | playback::StartKind::Stale => {
+                                "Воспроизведение".into()
+                            }
                         };
                         self.media_update();
                         self.command(json!(["set_property", "volume", self.volume]))
@@ -817,6 +869,8 @@ impl App {
             }
             Message::MutationDone(response) => {
                 self.delete_confirm = false;
+                let refresh_playlist = self.playlist_sync;
+                self.playlist_sync = false;
                 match response {
                     Ok(id) => {
                         self.status = "Изменение сохранено".into();
@@ -829,7 +883,11 @@ impl App {
                     }
                     Err(e) => {
                         self.status = e;
-                        Task::none()
+                        if refresh_playlist {
+                            self.fetch(self.route.clone(), false)
+                        } else {
+                            Task::none()
+                        }
                     }
                 }
             }
@@ -878,8 +936,111 @@ impl App {
         }
         Task::none()
     }
+    fn finish_drag(&mut self) -> Task<Message> {
+        let Some(drag) = self.drag.take() else {
+            return Task::none();
+        };
+        if drag.from == drag.hover {
+            return Task::none();
+        }
+        match drag.list {
+            DragList::Queue => {
+                self.queue.reorder(drag.from, drag.hover);
+                self.status = "Порядок очереди изменён".into();
+                Task::none()
+            }
+            DragList::Playlist => {
+                let Some(playlist_id) = owned_playlist(&self.route) else {
+                    return Task::none();
+                };
+                let Some(action) = playlist_reorder(&self.items, drag.from, drag.hover) else {
+                    self.status = "YouTube Music не дал позицию этого трека".into();
+                    return Task::none();
+                };
+                let item = self.items.remove(drag.from);
+                self.items.insert(drag.hover, item);
+                self.playlist_sync = true;
+                self.status = "Сохраняю порядок в YouTube Music…".into();
+                self.update(Message::Mutate(Mutation::Move {
+                    playlist_id,
+                    set_video_id: action.set_video_id,
+                    before_set_video_id: action.before_set_video_id.unwrap_or_default(),
+                }))
+            }
+        }
+    }
+    fn start_download(&mut self, id: String) -> Task<Message> {
+        match self.playback.downloads().phase(&id) {
+            DownloadPhase::Ready => {
+                self.status = "Трек уже скачан".into();
+                return Task::none();
+            }
+            DownloadPhase::Active(progress) => {
+                self.status = format!("Скачивание {progress}%");
+                return Task::none();
+            }
+            DownloadPhase::Idle | DownloadPhase::Failed => {}
+        }
+        let downloads = self.playback.downloads();
+        if !downloads.reserve(&id) {
+            self.status = "Скачивание уже идёт".into();
+            return Task::none();
+        }
+        self.status = "Скачивание…".into();
+        let cached = self.playback.cache().lookup(&id);
+        let resolver = self.resolver.clone();
+        Task::perform(
+            async move {
+                result(
+                    async {
+                        if let Some(path) = cached {
+                            let store = downloads.clone();
+                            let video_id = id.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                store.pin_copy(&video_id, &path)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => return Ok(()),
+                                Ok(Err(error)) => {
+                                    downloads.mark_failed(&id, error.to_string());
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    downloads.mark_failed(&id, message.clone());
+                                    return Err(anyhow::anyhow!(message));
+                                }
+                            }
+                        }
+                        match resolver.resolve(&id, false).await {
+                            Ok(stream) => downloads.save_stream(&id, stream).await,
+                            Err(error) => {
+                                downloads.mark_failed(&id, error.to_string());
+                                Err(error)
+                            }
+                        }
+                    }
+                    .await,
+                )
+            },
+            Message::DownloadFinished,
+        )
+    }
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+            iced::event::listen_with(|event, _status, _window| {
+                if let iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) = event
+                {
+                    Some(Message::DragDrop)
+                } else {
+                    None
+                }
+            }),
+        ])
     }
     fn view(&self) -> Element<'_, Message> {
         let accent = Color::from_rgb8(237, 83, 85);
@@ -908,21 +1069,33 @@ impl App {
             scrollable(column(self.queue.items.iter().enumerate().map(
                 |(i, item)| {
                     let caption = caption::split_subtitle(&item.subtitle);
-                    let title = soft_button(
-                        text(format!(
-                            "{} {}",
-                            if self.queue.index == Some(i) {
-                                "▶"
-                            } else {
-                                ""
-                            },
-                            item.title
-                        ))
-                        .size(12),
-                    )
-                    .on_press(Message::PlayQueue(i))
-                    .width(Length::Fill);
-                    let mut entry = column![title].spacing(0);
+                    let playing = if self.queue.index == Some(i) {
+                        "▶ "
+                    } else {
+                        ""
+                    };
+                    let marker = if self.drag.is_some_and(|drag| {
+                        drag.list == DragList::Queue && drag.hover == i && drag.from != i
+                    }) {
+                        "▸ "
+                    } else {
+                        ""
+                    };
+                    let title =
+                        soft_button(text(format!("{marker}{playing}{}", item.title)).size(12))
+                            .on_press(Message::PlayQueue(i))
+                            .width(Length::Fill);
+                    let mut entry = column![
+                        row![
+                            soft_button(text("⋮⋮").size(12))
+                                .on_press(Message::DragStart(DragList::Queue, i))
+                                .padding(4),
+                            title
+                        ]
+                        .spacing(4)
+                        .align_y(iced::Alignment::Center)
+                    ]
+                    .spacing(0);
                     if let Some(album) = caption.album {
                         entry = entry.push(
                             soft_button(
@@ -933,7 +1106,9 @@ impl App {
                             .width(Length::Fill),
                         );
                     }
-                    entry.into()
+                    mouse_area(entry)
+                        .on_enter(Message::DragHover(DragList::Queue, i))
+                        .into()
                 }
             )))
             .height(Length::Fill),
@@ -944,7 +1119,8 @@ impl App {
                     .unwrap_or("Аккаунт не подключён")
             )
             .size(13),
-            soft_button("Аккаунт / настройки").on_press(Message::Settings)
+            soft_button("Аккаунт / настройки").on_press(Message::Settings),
+            text(format!("{} · {}", app_version(), app_commit())).size(11)
         ]
         .spacing(14)
         .padding(20)
@@ -1070,19 +1246,54 @@ impl App {
                 .spacing(12)
                 .align_y(iced::Alignment::Center);
                 if item.kind == ItemKind::Track {
+                    let saved = download_caption(&self.playback.downloads(), &item.id);
+                    line = line
+                        .push(soft_button(text(saved).size(12)).on_press(Message::Download(index)));
                     line = line.push(soft_button("•••").on_press(Message::TrackMenu(index)));
                 }
-                list = list.push(container(line).padding(6));
+                let playlist_drag = item.kind == ItemKind::Track
+                    && item.set_video_id.is_some()
+                    && owned_playlist(&self.route).is_some();
+                if playlist_drag {
+                    let marker = if self.drag.is_some_and(|drag| {
+                        drag.list == DragList::Playlist && drag.hover == index && drag.from != index
+                    }) {
+                        "▸"
+                    } else {
+                        "⋮⋮"
+                    };
+                    line = row![
+                        soft_button(text(marker).size(12))
+                            .on_press(Message::DragStart(DragList::Playlist, index))
+                            .padding(4),
+                        line
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center);
+                }
+                let row_view: Element<_> = container(line).padding(6).into();
+                let row_view = if playlist_drag {
+                    mouse_area(row_view)
+                        .on_enter(Message::DragHover(DragList::Playlist, index))
+                        .into()
+                } else {
+                    row_view
+                };
+                list = list.push(row_view);
                 if self.selected == Some(index) {
                     list = list.push(
                         row![
                             soft_button("В очередь").on_press(Message::Enqueue(index)),
+                            soft_button("Следующим").on_press(Message::PlayNext(index)),
                             soft_button("Радио").on_press(Message::Radio(index)),
-                            soft_button("♥").on_press(Message::Mutate(Mutation::Like {
+                            soft_button("Лайк").on_press(Message::Mutate(Mutation::Like {
                                 video_id: item.id.clone(),
                                 liked: true
                             })),
-                            soft_button("Снять лайк").on_press(Message::Mutate(Mutation::Like {
+                            soft_button("Дизлайк").on_press(Message::Mutate(Mutation::Dislike {
+                                video_id: item.id.clone()
+                            })),
+                            soft_button("Снять оценку").on_press(Message::Mutate(Mutation::Like {
                                 video_id: item.id.clone(),
                                 liked: false
                             }))
@@ -1147,6 +1358,23 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
         let current = self.queue.current();
+        let mut like = soft_button("♥");
+        let mut dislike = soft_button("👎");
+        let mut save = soft_button(text(
+            current
+                .map(|item| download_caption(&self.playback.downloads(), &item.id))
+                .unwrap_or_else(|| "↓".into()),
+        ));
+        if let Some(item) = current {
+            like = like.on_press(Message::Mutate(Mutation::Like {
+                video_id: item.id.clone(),
+                liked: true,
+            }));
+            dislike = dislike.on_press(Message::Mutate(Mutation::Dislike {
+                video_id: item.id.clone(),
+            }));
+            save = save.on_press(Message::DownloadCurrent);
+        }
         let controls = row![
             soft_button("◀◀").on_press(Message::Previous),
             soft_button(if self.playing {
@@ -1180,7 +1408,8 @@ impl App {
                             .map(|i| i.subtitle.as_str())
                             .unwrap_or("Нативный звук • Rust")
                     )
-                    .size(12)
+                    .size(12),
+                    row![like, dislike, save].spacing(6)
                 ]
                 .width(Length::Fill),
                 controls,
@@ -1274,6 +1503,19 @@ impl App {
                     self.playback.cache().limit_bytes() / (1024 * 1024)
                 ))
                 .size(12),
+                text("Обложки и скачанные треки").size(22),
+                text(
+                    "Обложки сохраняются на диск и не запрашиваются заново. Кнопка ↓ рядом с треком скачивает его отдельно от кэша прослушивания: эти файлы не удаляются, когда кэш вытесняет старые треки. Повторное воспроизведение идёт из скачанного файла без сети.",
+                )
+                .size(12),
+                text(format!(
+                    "Скачано {} ({} МБ). Каталог: {}",
+                    self.playback.downloads().count(),
+                    self.playback.downloads().bytes() / (1024 * 1024),
+                    self.playback.downloads().directory().display()
+                ))
+                .size(12),
+                text(format!("Сборка {} · {}", app_version(), app_commit())).size(12),
                 soft_button("Выйти и удалить сохранённую сессию").on_press(Message::Disconnect)
             ]
             .spacing(16),
@@ -1303,6 +1545,43 @@ fn reconnect_prompt(session_active: bool) -> bool {
 
 fn soft_button<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Button<'a, Message> {
     iced::widget::button(content).style(button::secondary)
+}
+fn owned_playlist(route: &Route) -> Option<String> {
+    match route {
+        Route::Browse(id) if id.starts_with("VLPL") || id.starts_with("PL") => {
+            Some(id.trim_start_matches("VL").to_owned())
+        }
+        _ => None,
+    }
+}
+fn download_caption(store: &rustmusic_core::DownloadStore, id: &str) -> String {
+    match store.phase(id) {
+        DownloadPhase::Ready => "✓".into(),
+        DownloadPhase::Active(progress) => format!("{progress}%"),
+        DownloadPhase::Failed => "!".into(),
+        DownloadPhase::Idle => "↓".into(),
+    }
+}
+fn open_art() -> ArtCache {
+    let directory = default_covers_dir();
+    ArtCache::open(&directory).unwrap_or_else(|_| {
+        ArtCache::open(
+            std::env::temp_dir().join(format!("rustmusic-covers-{}", std::process::id())),
+        )
+        .expect("Не удалось создать каталог обложек")
+    })
+}
+fn decode_cover(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut reader = ::image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = ::image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?.thumbnail(128, 128).to_rgba8();
+    Some((image.width(), image.height(), image.into_raw()))
 }
 fn time(seconds: f32) -> String {
     let s = seconds.max(0.) as u32;
