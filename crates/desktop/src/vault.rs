@@ -198,26 +198,30 @@ fn config_dir() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .context("Не найден домашний каталог для сохранения сессии")?;
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(home.join("Library/Application Support/rustmusic"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var_os("APPDATA")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData").join("Roaming"));
-        return Ok(base.join("rustmusic"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
-        Ok(base.join("rustmusic"))
-    }
+    Ok(platform_config_dir(&home))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_config_dir(home: &std::path::Path) -> PathBuf {
+    home.join("Library/Application Support/rustmusic")
+}
+
+#[cfg(target_os = "windows")]
+fn platform_config_dir(home: &std::path::Path) -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+    base.join("rustmusic")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_config_dir(home: &std::path::Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    base.join("rustmusic")
 }
 
 fn encode(session: &Session) -> Result<String> {
