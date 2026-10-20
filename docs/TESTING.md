@@ -9,8 +9,11 @@
 - Track/album/artist parsing and pagination on anonymized fixtures; unknown
   provider shapes produce errors instead of fake success.
 - Audio proxy target validation.
-- Disk-cache LRU eviction, disabled/oversized entries, partial-file cleanup,
-  index rebuild, and cache-hit lookup staying under a network-resolve budget.
+- Disk-cache LRU eviction keeps a track that fits the budget and skips a track
+  larger than the whole budget without an error. Also disabled entries,
+  partial-file cleanup, index rebuild, and cache-hit lookup staying under a
+  network-resolve budget. Explicit downloads accept hour-long audio past the
+  old 80 MB file cap and still refuse a response past 1 GiB.
 - Stream URL expiry bounds and in-memory descriptor eviction.
 - Playback planning stops the current track before a resolve and skips the
   resolve when the track is already cached or pinned as an explicit download.
