@@ -16,7 +16,11 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
-const MAX_TRACK_BYTES: u64 = 80 * 1024 * 1024;
+/// Disk safety ceiling for one explicit download.
+///
+/// This is not the playback-cache budget. A mix or an hour-long audio file is
+/// saved whole; only a runaway response past 1 GiB is refused.
+const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const ALLOWED_EXT: &[&str] = &["m4a", "webm", "ogg", "mp3", "bin"];
 const MARKER: &str = ".rustmusic-pinned";
 
@@ -263,8 +267,15 @@ impl DownloadStore {
         if !ALLOWED_EXT.contains(&ext) {
             bail!("Некорректное расширение файла");
         }
-        let data = fs::read(source).context("Не удалось прочитать файл трека")?;
-        self.store(id, ext, &data)
+        let len = fs::metadata(source)
+            .context("Не удалось прочитать файл трека")?
+            .len();
+        if len == 0 || len > MAX_DOWNLOAD_BYTES {
+            bail!("Трек слишком большой для сохранения");
+        }
+        let partial = self.inner.canonical.join(format!("{id}.{ext}.partial"));
+        fs::copy(source, &partial).context("Не удалось прочитать файл трека")?;
+        self.commit_partial(id, ext, &partial)
     }
     pub fn store(&self, id: &str, ext: &str, data: &[u8]) -> Result<()> {
         if !valid_video_id(id) {
@@ -273,22 +284,30 @@ impl DownloadStore {
         if !ALLOWED_EXT.contains(&ext) {
             bail!("Некорректное расширение файла");
         }
-        if data.is_empty() || data.len() as u64 > MAX_TRACK_BYTES {
+        if data.is_empty() || data.len() as u64 > MAX_DOWNLOAD_BYTES {
             bail!("Трек слишком большой для сохранения");
         }
-        let name = format!("{id}.{ext}");
-        let partial = self.inner.canonical.join(format!("{name}.partial"));
+        let partial = self.inner.canonical.join(format!("{id}.{ext}.partial"));
         let mut file = fs::File::create(&partial)?;
         file.write_all(data)?;
         file.sync_all()?;
+        self.commit_partial(id, ext, &partial)
+    }
+    fn commit_partial(&self, id: &str, ext: &str, partial: &Path) -> Result<()> {
+        let bytes = fs::metadata(partial).map(|meta| meta.len()).unwrap_or(0);
+        if bytes == 0 || bytes > MAX_DOWNLOAD_BYTES {
+            let _ = fs::remove_file(partial);
+            bail!("Трек слишком большой для сохранения");
+        }
+        let name = format!("{id}.{ext}");
         let final_path = self.inner.canonical.join(&name);
-        replace_file(&partial, &final_path)?;
+        replace_file(partial, &final_path)?;
         let mut state = lock(&self.inner.state);
         state.index.entries.retain(|entry| entry.id != id);
         state.index.entries.push(Entry {
             id: id.to_owned(),
             name,
-            bytes: data.len() as u64,
+            bytes,
         });
         state.active.remove(id);
         save_index(&self.inner.canonical, &state.index)?;
@@ -381,15 +400,17 @@ impl DownloadStore {
             bail!("Не удалось скачать трек");
         }
         let hinted = response.content_length().filter(|len| *len > 0);
-        if hinted.is_some_and(|len| len > MAX_TRACK_BYTES) {
+        if hinted.is_some_and(|len| len > MAX_DOWNLOAD_BYTES) {
             bail!("Трек слишком большой для сохранения");
         }
         let mut file = tokio::fs::File::create(&partial).await?;
         let mut total = 0u64;
+        let mut too_big = false;
         while let Some(chunk) = response.chunk().await? {
             total = total.saturating_add(chunk.len() as u64);
-            if total > MAX_TRACK_BYTES {
-                bail!("Трек слишком большой для сохранения");
+            if total > MAX_DOWNLOAD_BYTES {
+                too_big = true;
+                break;
             }
             file.write_all(&chunk).await?;
             let progress = hinted
@@ -399,12 +420,16 @@ impl DownloadStore {
         }
         file.sync_all().await?;
         drop(file);
-        if total == 0 {
-            bail!("Пустой файл трека");
+        if too_big || total == 0 {
+            let _ = tokio::fs::remove_file(&partial).await;
+            let message = if too_big {
+                "Трек слишком большой для сохранения"
+            } else {
+                "Пустой файл трека"
+            };
+            bail!("{message}");
         }
-        let bytes = fs::read(&partial)?;
-        let _ = fs::remove_file(&partial);
-        self.store(id, ext, &bytes)?;
+        self.commit_partial(id, ext, &partial)?;
         Ok(())
     }
 }
@@ -536,6 +561,13 @@ mod tests {
         assert_eq!(store.count(), 1);
     }
     #[test]
+    fn mixes_and_hour_long_audio_fit_under_the_download_ceiling() {
+        let hour_at_256_kbps = 256 * 1000 / 8 * 60 * 60;
+        assert!(hour_at_256_kbps > 80 * 1024 * 1024);
+        assert!(hour_at_256_kbps <= MAX_DOWNLOAD_BYTES);
+        assert!(4 * hour_at_256_kbps <= MAX_DOWNLOAD_BYTES);
+    }
+    #[test]
     fn rejects_bad_ids_and_oversized_payloads() {
         let (_dir, store) = open();
         assert!(store.store("../etc/passwd", "m4a", &[1; 4]).is_err());
@@ -604,6 +636,48 @@ mod tests {
             fs::read(store.lookup("abcdefghijk").unwrap()).unwrap(),
             body
         );
+    }
+    #[tokio::test]
+    async fn content_length_past_the_ceiling_is_refused_before_a_file_is_kept() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut collected = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                    .await
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_DOWNLOAD_BYTES + 1
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, header.as_bytes())
+                .await
+                .unwrap();
+        });
+        let (dir, store) = open();
+        let error = store
+            .download_to(
+                "abcdefghijk",
+                &format!("http://127.0.0.1:{port}/track"),
+                &HashMap::new(),
+                "m4a",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("слишком большой"));
+        assert!(store.lookup("abcdefghijk").is_none());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
     }
     #[tokio::test]
     async fn save_stream_rejects_non_googlevideo_targets() {

@@ -13,7 +13,6 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_LIMIT_MB: u64 = 1024;
-const MAX_TRACK_BYTES: u64 = 80 * 1024 * 1024;
 const ALLOWED_EXT: &[&str] = &["m4a", "webm", "ogg", "mp3", "bin"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,8 +369,10 @@ impl TrackCache {
             state.active.remove(id);
         }
     }
+    /// One played track may use the whole cache budget. Older files are evicted
+    /// to make room. A track larger than the budget is skipped, not shown as an error.
     fn max_track(&self) -> u64 {
-        self.inner.limit_bytes.min(MAX_TRACK_BYTES)
+        self.inner.limit_bytes
     }
     fn partial_path(&self, id: &str, ext: &str) -> PathBuf {
         self.inner.canonical.join(format!("{id}.{ext}.partial"))
@@ -397,12 +398,17 @@ impl TrackCache {
         if response.status() != reqwest::StatusCode::OK {
             bail!("Кэш не сохранил трек");
         }
+        if response.content_length().is_some_and(|len| len > limit) {
+            return Ok(0);
+        }
         let mut file = tokio::fs::File::create(destination).await?;
         let mut total = 0u64;
         while let Some(chunk) = response.chunk().await? {
             total = total.saturating_add(chunk.len() as u64);
             if total > limit {
-                bail!("Трек больше лимита кэша");
+                drop(file);
+                let _ = tokio::fs::remove_file(destination).await;
+                return Ok(0);
             }
             file.write_all(&chunk).await?;
         }
@@ -695,6 +701,43 @@ mod tests {
         assert!(cache.usage_bytes() <= 100);
     }
     #[test]
+    fn long_track_uses_the_whole_cache_budget() {
+        let (_dir, cache) = open_limited(200 * 1024 * 1024);
+        assert_eq!(cache.max_track(), 200 * 1024 * 1024);
+        assert!(cache.max_track() > 80 * 1024 * 1024);
+    }
+    #[test]
+    fn a_fitting_track_evicts_older_audio_instead_of_being_refused() {
+        let (_dir, cache) = open_limited(100);
+        cache
+            .store_bytes("aaaaaaaaaaa", "m4a", &fake_audio(30))
+            .unwrap();
+        cache
+            .store_bytes("bbbbbbbbbbb", "m4a", &fake_audio(30))
+            .unwrap();
+        cache
+            .store_bytes("ccccccccccc", "m4a", &fake_audio(80))
+            .unwrap();
+        assert!(cache.lookup("ccccccccccc").is_some());
+        assert!(cache.lookup("aaaaaaaaaaa").is_none());
+        assert!(cache.lookup("bbbbbbbbbbb").is_none());
+        assert!(cache.usage_bytes() <= 100);
+    }
+    #[test]
+    fn a_track_larger_than_the_budget_is_skipped_quietly() {
+        let (_dir, cache) = open_limited(100);
+        cache
+            .store_bytes("bbbbbbbbbbb", "m4a", &fake_audio(40))
+            .unwrap();
+        assert!(
+            cache
+                .store_bytes("abcdefghijk", "m4a", &fake_audio(180))
+                .is_ok()
+        );
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert!(cache.lookup("bbbbbbbbbbb").is_some());
+    }
+    #[test]
     fn disabled_or_oversized_tracks_are_not_kept() {
         let (_dir, cache) = open_limited(0);
         cache.store_bytes("aaaaaaaaaaa", "m4a", &[1; 20]).unwrap();
@@ -789,6 +832,51 @@ mod tests {
         );
         let path = cache.lookup("abcdefghijk").unwrap();
         assert_eq!(fs::read(path).unwrap(), body);
+    }
+    #[tokio::test]
+    async fn announced_over_budget_audio_is_not_cached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut collected = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                    .await
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = "HTTP/1.1 200 OK\r\nContent-Length: 500\r\nConnection: close\r\n\r\n";
+            tokio::io::AsyncWriteExt::write_all(&mut socket, header.as_bytes())
+                .await
+                .unwrap();
+        });
+        let (dir, cache) = open_limited(100);
+        let partial = cache.partial_path("abcdefghijk", "m4a");
+        let bytes = cache
+            .download_url(
+                &format!("http://127.0.0.1:{port}/track"),
+                &std::collections::HashMap::new(),
+                &partial,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, 0);
+        assert!(
+            !cache
+                .commit_file("abcdefghijk", "m4a", &partial, bytes, None)
+                .unwrap()
+        );
+        assert!(cache.lookup("abcdefghijk").is_none());
+        assert!(!dir.path().join("abcdefghijk.m4a").exists());
     }
     #[test]
     fn commit_rejects_non_audio_and_purge_drops_a_committed_file() {

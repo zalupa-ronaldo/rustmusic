@@ -57,7 +57,8 @@ are never returned to the frontend. Stream descriptors stay in memory until the
 URL `expire` parameter, capped at 15 minutes, with at most 16 entries. The
 server does not persist the temporary playback cache. Explicit downloads are
 the exception: `POST /download/{video_id}` stores the file under
-`RUSTMUSIC_DATA_DIR/downloads` and never evicts it. Playback of that id serves
+`RUSTMUSIC_DATA_DIR/downloads` and never evicts it. That store is not limited
+by the playback-cache budget; one file may be up to 1 GiB. Playback of that id serves
 the local file, including `Range`. Cover art is a separate 64 MB LRU under
 `covers/`. `commit` is the short git hash baked in at build time (`-dirty`
 when the tree was dirty). The desktop app separately caches played audio on
