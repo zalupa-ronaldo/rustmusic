@@ -1,14 +1,14 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod caption;
+mod icons;
 mod playback;
 mod player;
+mod theme;
+mod ui;
 mod vault;
 use iced::{
-    Color, Element, Length, Subscription, Task, Theme,
-    widget::{
-        button, column, container, image, mouse_area, pick_list, row, rule, scrollable, slider,
-        text, text_input,
-    },
+    Element, Length, Subscription, Task, Theme,
+    widget::{column, container, image, pick_list, row, rule, scrollable, text, text_input},
 };
 use rustmusic_core::{
     Account, ArtCache, CacheConfig, DownloadPhase, Item, ItemKind, MusicClient, Mutation, Page,
@@ -19,7 +19,7 @@ use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Route {
+pub(crate) enum Route {
     Home,
     Library,
     Liked,
@@ -44,18 +44,43 @@ impl Route {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DragList {
+pub(crate) enum DragList {
     Queue,
     Playlist,
 }
 #[derive(Debug, Clone, Copy)]
-struct Drag {
+pub(crate) struct Drag {
     list: DragList,
     from: usize,
     hover: usize,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NowTab {
+    UpNext,
+    Lyrics,
+    Related,
+}
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MenuCommand {
+    Enqueue(usize),
+    Next(usize),
+    Radio(usize),
+    Like(usize),
+    Dislike(usize),
+    Unlike(usize),
+    Download(usize),
+    Add(usize),
+    Remove(usize),
+    Up(usize),
+    Share,
+}
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackMenu {
+    pub index: usize,
+    pub at: iced::Point,
+}
 #[derive(Debug, Clone)]
-enum Message {
+pub(crate) enum Message {
     Boot(Result<Option<Session>, String>),
     SessionConnected(Result<(Session, Account), String>),
     Query(String),
@@ -68,9 +93,7 @@ enum Message {
     PlayQueue(usize),
     Enqueue(usize),
     Radio(usize),
-    TrackMenu(usize),
     DragStart(DragList, usize),
-    DragHover(DragList, usize),
     DragDrop,
     PlayNext(usize),
     Download(usize),
@@ -106,60 +129,93 @@ enum Message {
     CacheDir(String),
     CacheLimit(String),
     SaveCache,
+    HoverTrack(Option<usize>),
+    HoverQueue(Option<usize>),
+    Pointer(iced::Point),
+    OpenMenu(usize),
+    CloseMenu,
+    Menu(MenuCommand),
+    ToggleQueue,
+    ToggleNowPlaying,
+    NowTab(NowTab),
+    SeekReleased,
+    Frame(std::time::Instant),
+    Navigator,
+    RadioCurrent,
 }
-struct App {
-    client: MusicClient,
-    resolver: Resolver,
-    player: player::Player,
-    playback: playback::Playback,
-    cache_dir: String,
-    cache_limit: String,
-    account: Option<Account>,
-    route: Route,
+pub(crate) struct App {
+    pub(crate) client: MusicClient,
+    pub(crate) resolver: Resolver,
+    pub(crate) player: player::Player,
+    pub(crate) playback: playback::Playback,
+    pub(crate) cache_dir: String,
+    pub(crate) cache_limit: String,
+    pub(crate) account: Option<Account>,
+    pub(crate) route: Route,
     /// Catalog request in flight. A repeated click on this route is ignored.
-    target_route: Option<Route>,
+    pub(crate) target_route: Option<Route>,
     /// Set when the user picks a section. The session probe must not replace it.
-    catalog_chosen: bool,
-    items: Vec<Item>,
-    continuation: Option<String>,
-    query: String,
+    pub(crate) catalog_chosen: bool,
+    pub(crate) items: Vec<Item>,
+    pub(crate) continuation: Option<String>,
+    pub(crate) query: String,
     /// Catalog and library messages. Playback never writes this field.
-    status: String,
+    pub(crate) status: String,
     /// Player messages. Catalog loading never writes this field.
-    player_status: String,
-    loading: bool,
-    request: u64,
-    fetch: Option<iced::task::Handle>,
-    covers: HashMap<String, image::Handle>,
-    queue: Queue,
-    play_id: u64,
-    play_task: Option<iced::task::Handle>,
-    playing: bool,
-    position: f32,
-    duration: f32,
-    volume: f32,
-    polling: bool,
-    loading_audio: bool,
-    open_failed: bool,
-    played_from_cache: bool,
-    store_armed: bool,
-    settings: bool,
-    browser: String,
-    profile: String,
-    auth_user: String,
-    manual: String,
-    target: String,
-    title: String,
-    selected: Option<usize>,
-    delete_confirm: bool,
-    connecting: bool,
-    art: ArtCache,
-    drag: Option<Drag>,
-    playlist_sync: bool,
+    pub(crate) player_status: String,
+    pub(crate) loading: bool,
+    pub(crate) request: u64,
+    pub(crate) fetch: Option<iced::task::Handle>,
+    pub(crate) covers: HashMap<String, image::Handle>,
+    pub(crate) cover_colors: HashMap<String, iced::Color>,
+    pub(crate) queue: Queue,
+    pub(crate) play_id: u64,
+    pub(crate) play_task: Option<iced::task::Handle>,
+    pub(crate) playing: bool,
+    pub(crate) position: f32,
+    pub(crate) duration: f32,
+    pub(crate) volume: f32,
+    pub(crate) polling: bool,
+    pub(crate) loading_audio: bool,
+    pub(crate) open_failed: bool,
+    pub(crate) played_from_cache: bool,
+    pub(crate) store_armed: bool,
+    pub(crate) settings: bool,
+    pub(crate) browser: String,
+    pub(crate) profile: String,
+    pub(crate) auth_user: String,
+    pub(crate) manual: String,
+    pub(crate) target: String,
+    pub(crate) title: String,
+    pub(crate) selected: Option<usize>,
+    pub(crate) delete_confirm: bool,
+    pub(crate) connecting: bool,
+    pub(crate) art: ArtCache,
+    pub(crate) drag: Option<Drag>,
+    pub(crate) playlist_sync: bool,
+    pub(crate) hovered_track: Option<usize>,
+    pub(crate) hovered_queue: Option<usize>,
+    pub(crate) pointer: iced::Point,
+    pub(crate) menu: Option<TrackMenu>,
+    pub(crate) menu_open: bool,
+    pub(crate) menu_anim: iced::animation::Animation<bool>,
+    pub(crate) queue_open: bool,
+    pub(crate) now_playing: bool,
+    pub(crate) now_tab: NowTab,
+    pub(crate) now_anim: iced::animation::Animation<bool>,
+    pub(crate) play_anim: iced::animation::Animation<bool>,
+    pub(crate) bg_anim: iced::animation::Animation<bool>,
+    pub(crate) bg_from: iced::Color,
+    pub(crate) bg_to: iced::Color,
+    pub(crate) liked: std::collections::HashSet<String>,
+    pub(crate) disliked: std::collections::HashSet<String>,
+    pub(crate) seek_drag: bool,
+    pub(crate) now: std::time::Instant,
+    pub(crate) last_poll: std::time::Instant,
     #[cfg(target_os = "macos")]
-    media: Option<souvlaki::MediaControls>,
+    pub(crate) media: Option<souvlaki::MediaControls>,
     #[cfg(target_os = "macos")]
-    media_events: std::sync::mpsc::Receiver<souvlaki::MediaControlEvent>,
+    pub(crate) media_events: std::sync::mpsc::Receiver<souvlaki::MediaControlEvent>,
 }
 fn result<T>(value: anyhow::Result<T>) -> Result<T, String> {
     value.map_err(|e| e.to_string())
@@ -208,6 +264,7 @@ impl App {
             request: 0,
             fetch: None,
             covers: HashMap::new(),
+            cover_colors: HashMap::new(),
             queue: Queue::default(),
             play_id: 0,
             play_task: None,
@@ -233,6 +290,25 @@ impl App {
             art: open_art(),
             drag: None,
             playlist_sync: false,
+            hovered_track: None,
+            hovered_queue: None,
+            pointer: iced::Point::ORIGIN,
+            menu: None,
+            menu_open: false,
+            menu_anim: theme::standard_animation(150),
+            queue_open: false,
+            now_playing: false,
+            now_tab: NowTab::UpNext,
+            now_anim: theme::expand_animation(),
+            play_anim: theme::standard_animation(150),
+            bg_anim: theme::standard_animation(200).go(true, std::time::Instant::now()),
+            bg_from: theme::SURFACE,
+            bg_to: theme::SURFACE,
+            liked: std::collections::HashSet::new(),
+            disliked: std::collections::HashSet::new(),
+            seek_drag: false,
+            now: std::time::Instant::now(),
+            last_poll: std::time::Instant::now(),
             #[cfg(target_os = "macos")]
             media,
             #[cfg(target_os = "macos")]
@@ -318,7 +394,7 @@ impl App {
         self.player.set_epoch(epoch);
         self.playback.arm(epoch);
         let Some(item) = self.queue.current().cloned() else {
-            self.playing = false;
+            self.set_playing(false);
             self.loading_audio = false;
             self.playback.cancel_prefetch();
             self.media_update();
@@ -333,7 +409,7 @@ impl App {
         self.open_failed = false;
         self.played_from_cache = false;
         self.store_armed = false;
-        self.playing = false;
+        self.set_playing(false);
         self.position = 0.;
         self.duration = 0.;
         self.player_status = if self.playback.downloads().lookup(&item.id).is_some() {
@@ -343,6 +419,7 @@ impl App {
         } else {
             format!("Открытие: {}", item.title)
         };
+        self.sync_stage_color();
         let resolver = self.resolver.clone();
         let player = self.player.clone();
         let playback = self.playback.clone();
@@ -615,9 +692,14 @@ impl App {
             Message::Cover(url, Some((width, height, bytes))) => {
                 if self.covers.len() >= 48 {
                     self.covers.clear();
+                    self.cover_colors.clear();
+                }
+                if let Some(color) = theme::dominant_color(&bytes) {
+                    self.cover_colors.insert(url.clone(), color);
                 }
                 self.covers
                     .insert(url, image::Handle::from_rgba(width, height, bytes));
+                self.sync_stage_color();
                 Task::none()
             }
             Message::Cover(_, None) => Task::none(),
@@ -667,14 +749,6 @@ impl App {
                     Task::none()
                 }
             }
-            Message::TrackMenu(i) => {
-                self.selected = if self.selected == Some(i) {
-                    None
-                } else {
-                    Some(i)
-                };
-                Task::none()
-            }
             Message::DragStart(list, index) => {
                 self.drag = Some(Drag {
                     list,
@@ -682,14 +756,6 @@ impl App {
                     hover: index,
                 });
                 self.status = "Перетащите трек и отпустите, чтобы изменить порядок".into();
-                Task::none()
-            }
-            Message::DragHover(list, index) => {
-                if let Some(drag) = &mut self.drag
-                    && drag.list == list
-                {
-                    drag.hover = index;
-                }
                 Task::none()
             }
             Message::DragDrop => self.finish_drag(),
@@ -731,7 +797,7 @@ impl App {
                 match response {
                     Ok(playback::StartKind::Stale) => Task::none(),
                     Ok(kind) => {
-                        self.playing = true;
+                        self.set_playing(true);
                         self.played_from_cache = kind == playback::StartKind::Cached;
                         self.player_status = match kind {
                             playback::StartKind::Offline => "Скачанный трек".into(),
@@ -744,7 +810,7 @@ impl App {
                         self.command(json!(["set_property", "volume", self.volume]))
                     }
                     Err(e) => {
-                        self.playing = false;
+                        self.set_playing(false);
                         self.open_failed = true;
                         self.player_status = e;
                         self.drop_current_stream()
@@ -758,7 +824,7 @@ impl App {
                 if self.open_failed {
                     return self.play();
                 }
-                self.playing = !self.playing;
+                self.set_playing(!self.playing);
                 self.media_update();
                 self.command(json!(["set_property", "pause", !self.playing]))
             }
@@ -788,6 +854,7 @@ impl App {
             }
             Message::Seek(value) => {
                 self.position = value;
+                self.seek_drag = true;
                 self.command(json!(["seek", value, "absolute"]))
             }
             Message::Volume(value) => {
@@ -842,7 +909,7 @@ impl App {
                                 return Task::none();
                             }
                             self.open_failed = true;
-                            self.playing = false;
+                            self.set_playing(false);
                             self.player_status = player_open_error(self.played_from_cache).into();
                             self.media_update();
                             let id = self.queue.current().map(|item| item.id.clone());
@@ -850,7 +917,7 @@ impl App {
                         }
                         self.position = status.position;
                         self.duration = status.duration;
-                        self.playing = !status.paused;
+                        self.set_playing(!status.paused);
                         self.media_update();
                         let store = self.store_audible_track(status.position, status.duration);
                         if status.ended
@@ -864,7 +931,7 @@ impl App {
                     }
                     Err(e) => {
                         self.player_status = e;
-                        self.playing = false;
+                        self.set_playing(false);
                     }
                 }
                 Task::none()
@@ -929,7 +996,7 @@ impl App {
                     self.client = MusicClient::new(None).unwrap();
                     self.resolver = Resolver::new(None);
                     self.queue = Queue::default();
-                    self.playing = false;
+                    self.set_playing(false);
                     self.open_failed = false;
                     self.player_status.clear();
                     self.items.clear();
@@ -952,6 +1019,22 @@ impl App {
                 Task::none()
             }
             Message::Mutate(mutation) => {
+                match &mutation {
+                    Mutation::Like { video_id, liked } => {
+                        if *liked {
+                            self.liked.insert(video_id.clone());
+                            self.disliked.remove(video_id);
+                        } else {
+                            self.liked.remove(video_id);
+                            self.disliked.remove(video_id);
+                        }
+                    }
+                    Mutation::Dislike { video_id } => {
+                        self.disliked.insert(video_id.clone());
+                        self.liked.remove(video_id);
+                    }
+                    _ => {}
+                }
                 let client = self.client.clone();
                 self.status = "Сохранение…".into();
                 Task::perform(
@@ -1006,7 +1089,221 @@ impl App {
                 Task::none()
             }
             Message::SaveCache => self.save_cache(),
+            Message::HoverTrack(index) => {
+                self.hovered_track = index;
+                if let Some(index) = index
+                    && let Some(drag) = &mut self.drag
+                    && drag.list == DragList::Playlist
+                {
+                    drag.hover = index;
+                }
+                Task::none()
+            }
+            Message::HoverQueue(index) => {
+                self.hovered_queue = index;
+                if let Some(index) = index
+                    && let Some(drag) = &mut self.drag
+                    && drag.list == DragList::Queue
+                {
+                    drag.hover = index;
+                }
+                Task::none()
+            }
+            Message::Pointer(point) => {
+                self.pointer = point;
+                Task::none()
+            }
+            Message::OpenMenu(index) => {
+                let at = std::time::Instant::now();
+                self.now = at;
+                self.menu = Some(TrackMenu {
+                    index,
+                    at: self.pointer,
+                });
+                self.menu_open = true;
+                self.menu_anim = theme::standard_animation(200).go(true, at);
+                Task::none()
+            }
+            Message::CloseMenu => self.close_menu(),
+            Message::Menu(command) => {
+                let follow = self.close_menu();
+                Task::batch([follow, self.menu_command(command)])
+            }
+            Message::ToggleQueue => {
+                self.queue_open = !self.queue_open;
+                Task::none()
+            }
+            Message::ToggleNowPlaying => {
+                let at = std::time::Instant::now();
+                self.now = at;
+                self.now_playing = !self.now_playing;
+                self.now_anim.go_mut(self.now_playing, at);
+                Task::none()
+            }
+            Message::NowTab(tab) => {
+                self.now_tab = tab;
+                Task::none()
+            }
+            Message::SeekReleased => {
+                self.seek_drag = false;
+                Task::none()
+            }
+            Message::Frame(at) => {
+                self.now = at;
+                if !self.menu_open && !self.menu_anim.is_animating(at) {
+                    self.menu = None;
+                }
+                if at.duration_since(self.last_poll) >= Duration::from_millis(500) {
+                    self.last_poll = at;
+                    self.update(Message::Tick)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Navigator => {
+                self.settings = false;
+                self.catalog_chosen = true;
+                self.route = Route::Search(String::new());
+                self.items.clear();
+                self.continuation = None;
+                self.status = "Найдите трек, альбом или исполнителя".into();
+                Task::none()
+            }
+            Message::RadioCurrent => {
+                let Some(id) = self.queue.current().map(|item| item.id.clone()) else {
+                    return Task::none();
+                };
+                self.catalog_chosen = true;
+                self.now_playing = false;
+                self.now_anim.go_mut(false, std::time::Instant::now());
+                self.fetch(Route::Radio(id), false)
+            }
         }
+    }
+    fn set_playing(&mut self, playing: bool) {
+        if self.playing != playing {
+            self.play_anim.go_mut(playing, std::time::Instant::now());
+        }
+        self.playing = playing;
+    }
+    fn close_menu(&mut self) -> Task<Message> {
+        let at = std::time::Instant::now();
+        self.now = at;
+        self.menu_open = false;
+        self.menu_anim = theme::standard_animation(150).go(false, at);
+        Task::none()
+    }
+    fn menu_command(&mut self, command: MenuCommand) -> Task<Message> {
+        match command {
+            MenuCommand::Enqueue(index) => self.update(Message::Enqueue(index)),
+            MenuCommand::Next(index) => self.update(Message::PlayNext(index)),
+            MenuCommand::Radio(index) => self.update(Message::Radio(index)),
+            MenuCommand::Download(index) => self.update(Message::Download(index)),
+            MenuCommand::Like(index) => self.rate(index, true),
+            MenuCommand::Unlike(index) => self.rate(index, false),
+            MenuCommand::Dislike(index) => {
+                let Some(item) = self.items.get(index).cloned() else {
+                    return Task::none();
+                };
+                self.disliked.insert(item.id.clone());
+                self.liked.remove(&item.id);
+                self.update(Message::Mutate(Mutation::Dislike { video_id: item.id }))
+            }
+            MenuCommand::Add(index) => {
+                let Some(item) = self.items.get(index).cloned() else {
+                    return Task::none();
+                };
+                self.update(Message::Mutate(Mutation::Add {
+                    playlist_id: self.target.clone(),
+                    video_id: item.id,
+                }))
+            }
+            MenuCommand::Remove(index) => {
+                let Some(item) = self.items.get(index).cloned() else {
+                    return Task::none();
+                };
+                let Some(set_video_id) = item.set_video_id.clone() else {
+                    return Task::none();
+                };
+                let Some(playlist_id) = owned_playlist(&self.route) else {
+                    return Task::none();
+                };
+                self.update(Message::Mutate(Mutation::Remove {
+                    playlist_id,
+                    video_id: item.id,
+                    set_video_id,
+                }))
+            }
+            MenuCommand::Up(index) => {
+                if index == 0 {
+                    return Task::none();
+                }
+                let Some(item) = self.items.get(index).cloned() else {
+                    return Task::none();
+                };
+                let Some(previous) = self.items[index - 1].set_video_id.clone() else {
+                    return Task::none();
+                };
+                let Some(set_video_id) = item.set_video_id.clone() else {
+                    return Task::none();
+                };
+                let Some(playlist_id) = owned_playlist(&self.route) else {
+                    return Task::none();
+                };
+                self.update(Message::Mutate(Mutation::Move {
+                    playlist_id,
+                    set_video_id,
+                    before_set_video_id: previous,
+                }))
+            }
+            MenuCommand::Share => {
+                self.status = "Поделиться появится, когда у трека будет публичная ссылка".into();
+                Task::none()
+            }
+        }
+    }
+    fn rate(&mut self, index: usize, liked: bool) -> Task<Message> {
+        let Some(item) = self.items.get(index).cloned() else {
+            return Task::none();
+        };
+        if liked {
+            self.liked.insert(item.id.clone());
+            self.disliked.remove(&item.id);
+        } else {
+            self.liked.remove(&item.id);
+        }
+        self.update(Message::Mutate(Mutation::Like {
+            video_id: item.id,
+            liked,
+        }))
+    }
+    fn sync_stage_color(&mut self) {
+        let next = self
+            .queue
+            .current()
+            .and_then(|item| item.thumbnail.as_ref())
+            .and_then(|url| self.cover_colors.get(url).copied())
+            .unwrap_or(theme::SURFACE);
+        let at = std::time::Instant::now();
+        let shown = theme::mix(
+            self.bg_from,
+            self.bg_to,
+            self.bg_anim.interpolate(0.0, 1.0, at),
+        );
+        if (shown.r - next.r).abs() + (shown.g - next.g).abs() + (shown.b - next.b).abs() < 0.02 {
+            return;
+        }
+        self.bg_from = shown;
+        self.bg_to = next;
+        self.bg_anim = theme::standard_animation(200).go(true, at);
+        self.now = at;
+    }
+    fn needs_frames(&self) -> bool {
+        let at = self.now;
+        self.now_anim.is_animating(at)
+            || self.play_anim.is_animating(at)
+            || self.bg_anim.is_animating(at)
+            || self.menu_anim.is_animating(at)
     }
     fn save_cache(&mut self) -> Task<Message> {
         let Ok(limit_mb) = self.cache_limit.trim().parse::<u64>() else {
@@ -1129,8 +1426,13 @@ impl App {
         )
     }
     fn subscription(&self) -> Subscription<Message> {
+        let clock = if self.needs_frames() {
+            iced::window::frames().map(Message::Frame)
+        } else {
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick)
+        };
         Subscription::batch([
-            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+            clock,
             iced::event::listen_with(|event, _status, _window| {
                 if let iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
@@ -1144,407 +1446,65 @@ impl App {
         ])
     }
     fn view(&self) -> Element<'_, Message> {
-        let accent = Color::from_rgb8(237, 83, 85);
-        let sidebar = column![
-            text("RustMusic").size(26).color(accent),
-            text("YOUTUBE MUSIC CLIENT").size(10),
-            rule::horizontal(1),
-            soft_button("Для вас")
-                .on_press(Message::Go(Route::Home))
-                .width(Length::Fill),
-            soft_button("Библиотека")
-                .on_press(Message::Go(Route::Library))
-                .width(Length::Fill),
-            soft_button("Любимые треки")
-                .on_press(Message::Go(Route::Liked))
-                .width(Length::Fill),
-            soft_button("Мои альбомы")
-                .on_press(Message::Go(Route::Browse("FEmusic_liked_albums".into())))
-                .width(Length::Fill),
-            soft_button("Мои исполнители")
-                .on_press(Message::Go(Route::Browse(
-                    "FEmusic_library_corpus_track_artists".into()
-                )))
-                .width(Length::Fill),
-            text("ОЧЕРЕДЬ").size(12),
-            scrollable(column(self.queue.items.iter().enumerate().map(
-                |(i, item)| {
-                    let caption = caption::split_subtitle(&item.subtitle);
-                    let playing = if self.queue.index == Some(i) {
-                        "▶ "
-                    } else {
-                        ""
-                    };
-                    let marker = if self.drag.is_some_and(|drag| {
-                        drag.list == DragList::Queue && drag.hover == i && drag.from != i
-                    }) {
-                        "▸ "
-                    } else {
-                        ""
-                    };
-                    let title =
-                        soft_button(text(format!("{marker}{playing}{}", item.title)).size(12))
-                            .on_press(Message::PlayQueue(i))
-                            .width(Length::Fill);
-                    let mut entry = column![
-                        row![
-                            soft_button(text("⋮⋮").size(12))
-                                .on_press(Message::DragStart(DragList::Queue, i))
-                                .padding(4),
-                            title
-                        ]
-                        .spacing(4)
-                        .align_y(iced::Alignment::Center)
-                    ]
-                    .spacing(0);
-                    if let Some(album) = caption.album {
-                        entry = entry.push(
-                            soft_button(
-                                text(album).size(11).color(Color::from_rgb8(150, 153, 165)),
-                            )
-                            .style(button::text)
-                            .on_press(Message::PlayQueue(i))
-                            .width(Length::Fill),
-                        );
-                    }
-                    mouse_area(entry)
-                        .on_enter(Message::DragHover(DragList::Queue, i))
-                        .into()
-                }
-            )))
-            .height(Length::Fill),
-            text(
-                self.account
-                    .as_ref()
-                    .map(|a| a.name.as_str())
-                    .unwrap_or("Аккаунт не подключён")
-            )
-            .size(13),
-            soft_button("Аккаунт / настройки").on_press(Message::Settings),
-            text(format!("{} · {}", app_version(), app_commit())).size(11)
+        iced::widget::responsive(|size| self.shell(size)).into()
+    }
+    fn shell(&self, size: iced::Size) -> Element<'_, Message> {
+        let progress = self.now_anim.interpolate(0.0, 1.0, self.now);
+        let fade = theme::content_fade(progress);
+        let stage_h = (size.height - theme::PLAYER_HEIGHT).max(0.0);
+        let now_h = stage_h * progress;
+        let content_h = (stage_h - now_h).max(0.0);
+        let mut center = iced::widget::row![
+            container(self.catalog())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::content_bg)
         ]
-        .spacing(14)
-        .padding(20)
-        .width(230);
-        let search = row![
-            text_input("Найти музыку, альбом или исполнителя", &self.query)
-                .on_input(Message::Query)
-                .on_submit(Message::Search)
-                .padding(12),
-            soft_button("Поиск").on_press(Message::Search).padding(12)
-        ]
-        .spacing(10);
-        let content: Element<_> = if self.settings {
+        .height(Length::Fixed(content_h));
+        if self.queue_open {
+            center = center.push(self.queue_panel());
+        }
+        let mut stage = iced::widget::column![center]
+            .width(Length::Fill)
+            .height(Length::Fixed(stage_h));
+        if now_h > 1.0 {
+            let shown = theme::mix(
+                self.bg_from,
+                self.bg_to,
+                self.bg_anim.interpolate(0.0, 1.0, self.now),
+            );
+            let wash = iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
+                .add_stop(0.0, shown)
+                .add_stop(1.0, theme::CONTENT);
+            stage = stage.push(
+                container(self.now_playing(fade))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(now_h))
+                    .style(move |_theme| container::Style::default().background(wash))
+                    .clip(true),
+            );
+        }
+        let body = iced::widget::row![self.sidebar(), stage]
+            .height(Length::Fixed(stage_h))
+            .width(Length::Fill);
+        let shell = iced::widget::column![body, self.player_bar()]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if self.menu.is_some() {
+            iced::widget::Stack::with_children([shell.into(), self.menu_layer(size)])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            shell.into()
+        }
+    }
+    fn catalog(&self) -> Element<'_, Message> {
+        if self.settings {
             self.settings_view()
         } else {
-            let mut list = column![text(self.route.title()).size(28)].spacing(10);
-            if self.account.is_some() {
-                list = list.push(
-                    row![
-                        text_input("Название плейлиста", &self.title)
-                            .on_input(Message::Title)
-                            .padding(8),
-                        soft_button("Создать").on_press(Message::Mutate(Mutation::Create {
-                            title: self.title.clone()
-                        }))
-                    ]
-                    .spacing(8),
-                );
-                if let Route::Browse(id) = &self.route
-                    && (id.starts_with("VLPL") || id.starts_with("PL"))
-                {
-                    let playlist_id = id.trim_start_matches("VL").to_owned();
-                    list = list.push(
-                        row![
-                            soft_button("Переименовать").on_press(Message::Mutate(
-                                Mutation::Rename {
-                                    playlist_id: playlist_id.clone(),
-                                    title: self.title.clone()
-                                }
-                            )),
-                            soft_button("Удалить плейлист").on_press(Message::DeleteConfirm(true))
-                        ]
-                        .spacing(8),
-                    );
-                    if self.delete_confirm {
-                        list = list.push(
-                            row![
-                                text("Удалить этот плейлист из аккаунта?"),
-                                soft_button("Да, удалить").on_press(Message::Mutate(
-                                    Mutation::Delete {
-                                        playlist_id: playlist_id.clone()
-                                    }
-                                )),
-                                soft_button("Отмена").on_press(Message::DeleteConfirm(false))
-                            ]
-                            .spacing(8),
-                        );
-                    }
-                }
-            }
-            for (index, item) in self.items.iter().enumerate() {
-                let cover: Element<_> = item
-                    .thumbnail
-                    .as_ref()
-                    .and_then(|url| self.covers.get(url))
-                    .map(|handle| image(handle.clone()).width(52).height(52).into())
-                    .unwrap_or_else(|| {
-                        container(
-                            text(if item.kind == ItemKind::Track {
-                                "♫"
-                            } else {
-                                "▣"
-                            })
-                            .size(24)
-                            .color(accent),
-                        )
-                        .center_x(52)
-                        .center_y(52)
-                        .into()
-                    });
-                let caption = caption::split_subtitle(&item.subtitle);
-                let muted = Color::from_rgb8(150, 153, 165);
-                let title_button = soft_button(
-                    container(text(&item.title).size(16))
-                        .width(Length::Fill)
-                        .align_x(iced::alignment::Horizontal::Left),
-                )
-                .style(button::text)
-                .on_press(Message::Open(index))
-                .width(Length::FillPortion(3));
-                let mut heading = row![title_button]
-                    .spacing(8)
-                    .align_y(iced::Alignment::Center);
-                if let Some(album) = caption.album {
-                    heading = heading.push(
-                        soft_button(text(album).size(12).color(muted))
-                            .style(button::text)
-                            .on_press(Message::Open(index))
-                            .width(Length::FillPortion(2)),
-                    );
-                }
-                let mut info = column![heading].spacing(2).width(Length::Fill);
-                if !caption.artist.is_empty() {
-                    info = info.push(
-                        soft_button(
-                            container(text(caption.artist).size(12).color(muted))
-                                .width(Length::Fill)
-                                .align_x(iced::alignment::Horizontal::Left),
-                        )
-                        .style(button::text)
-                        .on_press(Message::Open(index))
-                        .width(Length::Fill),
-                    );
-                }
-                let mut line = row![
-                    soft_button(cover)
-                        .style(button::text)
-                        .padding(0)
-                        .on_press(Message::Open(index)),
-                    info,
-                    text(item.duration.as_deref().unwrap_or("")).size(12)
-                ]
-                .spacing(12)
-                .align_y(iced::Alignment::Center);
-                if item.kind == ItemKind::Track {
-                    let saved = download_caption(&self.playback.downloads(), &item.id);
-                    line = line
-                        .push(soft_button(text(saved).size(12)).on_press(Message::Download(index)));
-                    line = line.push(soft_button("•••").on_press(Message::TrackMenu(index)));
-                }
-                let playlist_drag = item.kind == ItemKind::Track
-                    && item.set_video_id.is_some()
-                    && owned_playlist(&self.route).is_some();
-                if playlist_drag {
-                    let marker = if self.drag.is_some_and(|drag| {
-                        drag.list == DragList::Playlist && drag.hover == index && drag.from != index
-                    }) {
-                        "▸"
-                    } else {
-                        "⋮⋮"
-                    };
-                    line = row![
-                        soft_button(text(marker).size(12))
-                            .on_press(Message::DragStart(DragList::Playlist, index))
-                            .padding(4),
-                        line
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center);
-                }
-                let row_view: Element<_> = container(line).padding(6).into();
-                let row_view = if playlist_drag {
-                    mouse_area(row_view)
-                        .on_enter(Message::DragHover(DragList::Playlist, index))
-                        .into()
-                } else {
-                    row_view
-                };
-                list = list.push(row_view);
-                if self.selected == Some(index) {
-                    list = list.push(
-                        row![
-                            soft_button("В очередь").on_press(Message::Enqueue(index)),
-                            soft_button("Следующим").on_press(Message::PlayNext(index)),
-                            soft_button("Радио").on_press(Message::Radio(index)),
-                            soft_button("Лайк").on_press(Message::Mutate(Mutation::Like {
-                                video_id: item.id.clone(),
-                                liked: true
-                            })),
-                            soft_button("Дизлайк").on_press(Message::Mutate(Mutation::Dislike {
-                                video_id: item.id.clone()
-                            })),
-                            soft_button("Снять оценку").on_press(Message::Mutate(Mutation::Like {
-                                video_id: item.id.clone(),
-                                liked: false
-                            }))
-                        ]
-                        .spacing(8),
-                    );
-                    list = list.push(
-                        row![
-                            text_input("ID целевого плейлиста", &self.target)
-                                .on_input(Message::Target),
-                            soft_button("Добавить").on_press(Message::Mutate(Mutation::Add {
-                                playlist_id: self.target.clone(),
-                                video_id: item.id.clone()
-                            }))
-                        ]
-                        .spacing(8),
-                    );
-                    if let Some(set_id) = &item.set_video_id
-                        && let Route::Browse(id) = &self.route
-                    {
-                        let mut actions = row![soft_button("Убрать из плейлиста").on_press(
-                            Message::Mutate(Mutation::Remove {
-                                playlist_id: id.trim_start_matches("VL").into(),
-                                video_id: item.id.clone(),
-                                set_video_id: set_id.clone()
-                            })
-                        )]
-                        .spacing(8);
-                        if index > 0
-                            && let Some(previous) = self.items[index - 1].set_video_id.clone()
-                        {
-                            actions = actions.push(soft_button("Выше").on_press(Message::Mutate(
-                                Mutation::Move {
-                                    playlist_id: id.trim_start_matches("VL").into(),
-                                    set_video_id: set_id.clone(),
-                                    before_set_video_id: previous,
-                                },
-                            )));
-                        }
-                        list = list.push(actions);
-                    }
-                }
-            }
-            if self.continuation.is_some() {
-                let mut more = soft_button("Загрузить ещё");
-                if !self.loading {
-                    more = more.on_press(Message::More);
-                }
-                list = list.push(more);
-            }
-            scrollable(list).height(Length::Fill).into()
-        };
-        let main = column![
-            search,
-            content,
-            text(&self.status)
-                .size(12)
-                .color(Color::from_rgb8(172, 175, 187))
-        ]
-        .spacing(18)
-        .padding(24)
-        .width(Length::Fill)
-        .height(Length::Fill);
-        let current = self.queue.current();
-        let mut like = soft_button("♥");
-        let mut dislike = soft_button("👎");
-        let mut save = soft_button(text(
-            current
-                .map(|item| download_caption(&self.playback.downloads(), &item.id))
-                .unwrap_or_else(|| "↓".into()),
-        ));
-        if let Some(item) = current {
-            like = like.on_press(Message::Mutate(Mutation::Like {
-                video_id: item.id.clone(),
-                liked: true,
-            }));
-            dislike = dislike.on_press(Message::Mutate(Mutation::Dislike {
-                video_id: item.id.clone(),
-            }));
-            save = save.on_press(Message::DownloadCurrent);
+            self.library()
         }
-        let controls = row![
-            soft_button("◀◀").on_press(Message::Previous),
-            soft_button(if self.playing {
-                "Пауза"
-            } else {
-                "Играть"
-            })
-            .on_press(Message::Toggle),
-            soft_button("▶▶").on_press(Message::Next(false)),
-            soft_button("Перемешать").on_press(Message::Shuffle),
-            soft_button(match self.queue.repeat {
-                Repeat::Off => "Повтор: выкл",
-                Repeat::All => "Повтор: все",
-                Repeat::One => "Повтор: один",
-            })
-            .on_press(Message::Repeat)
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        let transport = row![
-            column![
-                text(
-                    current
-                        .map(|i| i.title.as_str())
-                        .unwrap_or("Выберите музыку")
-                )
-                .size(16),
-                text(
-                    current
-                        .map(|i| i.subtitle.as_str())
-                        .unwrap_or("Нативный звук • Rust")
-                )
-                .size(12),
-                row![like, dislike, save].spacing(6)
-            ]
-            .width(Length::Fill),
-            controls,
-            text("Громкость").size(12),
-            slider(0.0..=100.0, self.volume, Message::Volume).width(100)
-        ]
-        .spacing(16)
-        .align_y(iced::Alignment::Center);
-        let mut footer = column![transport].spacing(12).padding(18);
-        if !self.player_status.is_empty() {
-            let color = if self.open_failed {
-                accent
-            } else {
-                Color::from_rgb8(172, 175, 187)
-            };
-            footer = footer.push(text(&self.player_status).size(12).color(color));
-        }
-        let footer = footer.push(
-            row![
-                text(time(self.position)).size(12),
-                slider(
-                    0.0..=self.duration.max(1.),
-                    self.position.min(self.duration.max(1.)),
-                    Message::Seek
-                ),
-                text(time(self.duration)).size(12)
-            ]
-            .spacing(12),
-        );
-        column![
-            row![sidebar, main].height(Length::Fill),
-            rule::horizontal(1),
-            footer
-        ]
-        .into()
     }
     fn settings_view(&self) -> Element<'_, Message> {
         let mut connect = soft_button(if self.connecting {
@@ -1686,7 +1646,7 @@ fn decode_cover(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 fn soft_button<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Button<'a, Message> {
-    iced::widget::button(content).style(button::secondary)
+    icons::text_button(content)
 }
 fn owned_playlist(route: &Route) -> Option<String> {
     match route {
@@ -1694,14 +1654,6 @@ fn owned_playlist(route: &Route) -> Option<String> {
             Some(id.trim_start_matches("VL").to_owned())
         }
         _ => None,
-    }
-}
-fn download_caption(store: &rustmusic_core::DownloadStore, id: &str) -> String {
-    match store.phase(id) {
-        DownloadPhase::Ready => "✓".into(),
-        DownloadPhase::Active(progress) => format!("{progress}%"),
-        DownloadPhase::Failed => "!".into(),
-        DownloadPhase::Idle => "↓".into(),
     }
 }
 fn open_art() -> ArtCache {
@@ -1713,7 +1665,7 @@ fn open_art() -> ArtCache {
         .expect("Не удалось создать каталог обложек")
     })
 }
-fn time(seconds: f32) -> String {
+pub(crate) fn time(seconds: f32) -> String {
     let s = seconds.max(0.) as u32;
     format!("{}:{:02}", s / 60, s % 60)
 }
@@ -1723,12 +1675,12 @@ fn main() -> iced::Result {
         .theme(Theme::custom(
             "RustMusic",
             iced::theme::Palette {
-                background: Color::from_rgb8(16, 17, 23),
-                text: Color::from_rgb8(238, 240, 246),
-                primary: Color::from_rgb8(255, 99, 105),
-                success: Color::from_rgb8(99, 205, 155),
-                warning: Color::from_rgb8(225, 180, 90),
-                danger: Color::from_rgb8(255, 99, 105),
+                background: theme::CONTENT,
+                text: theme::TEXT,
+                primary: theme::BRAND,
+                success: theme::ACTIVE,
+                warning: theme::LINK,
+                danger: theme::BRAND,
             },
         ))
         .subscription(App::subscription)

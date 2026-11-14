@@ -1,0 +1,7 @@
+These SVG icons are Material Icons from the material-design-icons project
+(https://github.com/google/material-design-icons), licensed under the Apache
+License, Version 2.0. The full license text is in LICENSE in this directory.
+
+They are not YouTube, YouTube Music, or other Google brand assets. RustMusic
+does not include YouTube Music icons, YouTube Sans, or Lottie files.
+The desktop UI uses the operating system font (SF Pro on macOS).
