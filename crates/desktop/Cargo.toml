@@ -10,7 +10,7 @@ serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 rustmusic-core.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "image-without-codecs", "x11", "wayland"] }
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "image-without-codecs", "svg", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 webbrowser = "1"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
